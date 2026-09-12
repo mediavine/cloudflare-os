@@ -887,6 +887,12 @@ You were started programmatically by the Gadget to perform a task. The specific 
 Typically (but not always), you will need to use the \`executeCode\` tool to complete the task, invoking the available bindings (members of the env object) and other APIs available to you.
 `.trim();
 
+// Appended to SPAWNER_SYSTEM_PROMPT when the spawner opts its agents into worktrees
+// (AgentSpawnerConfig.allowWorktrees).
+let SPAWNER_WORKTREE_PROMPT = `
+You also have the \`createWorktree\` tool. A worktree is a file tree rooted at a git commit, for example a commit id obtained from a GitHub repository binding via \`resolveRef\`. After creating one under a \`bindingName\` of your choice, operate on it from \`executeCode\` through \`env.<bindingName>\`: \`listFiles\`, \`readFile\`, \`grep\`/\`structuredGrep\`, \`writeFile\`, \`diff\`, \`commit\`, and more; call \`describeBinding\` on it to see the full API. The interactive file-editing tools are not available to you; use the executeCode API instead. Committing in a worktree changes nothing outside it. To publish a commit, pass its id to the repository binding's \`push\`/\`createPullRequest\`, which may pause for the workspace owner's approval.
+`.trim();
+
 let READ_FILE_TOOL_DESCRIPTION = `
 Read the content of a file owned by one of the workspace's gadgets. If a file changes after you read it, you will either be informed of the change or the outdated result will be replaced with a note telling you to re-read the file; otherwise there is no need to read a file again after you have already read it once. This cannot read chat attachments; attachments are provided directly in the conversation.
 `.trim();
@@ -2373,10 +2379,13 @@ export async function runAgent(
     }
 
     // Split the system prompt into static and dynamic parts for better caching.
+    let spawnerPrompt = agentContext.spawnerConfig.allowWorktrees
+        ? `${SPAWNER_SYSTEM_PROMPT}\n\n${SPAWNER_WORKTREE_PROMPT}`
+        : SPAWNER_SYSTEM_PROMPT;
     systemPromptSlots = [
       instanceInstructions
-          ? `${SPAWNER_SYSTEM_PROMPT}\n\n${instanceInstructions}`
-          : SPAWNER_SYSTEM_PROMPT,
+          ? `${spawnerPrompt}\n\n${instanceInstructions}`
+          : spawnerPrompt,
       alwaysAvailableResourcesPrompt
           ? `${systemPromptBindings}\n\n${alwaysAvailableResourcesPrompt}`
           : systemPromptBindings,
@@ -3245,9 +3254,15 @@ export async function runAgent(
   if (agentContext.spawnerConfig) {
     // Restrict sub-agents to a narrower set of tools: they can inspect and call bindings in code
     // (which is how they read reference knowledge), but not the full editing/connection surface.
+    // A spawner may opt its agents into `createWorktree` (AgentSpawnerConfig.allowWorktrees). The
+    // worktree is then driven through its `executeCode` API rather than the file tools, and
+    // anything leaving it (push, pull request) is still a gatekeeper action under the workspace's
+    // approval rules.
     tools = {
       describeBinding: tools.describeBinding,
       executeCode: tools.executeCode,
+      ...(agentContext.spawnerConfig.allowWorktrees
+          ? {createWorktree: tools.createWorktree} : {}),
       ...(callbackInitiated ? {giveUp: tools.giveUp} : {}),
     };
   }

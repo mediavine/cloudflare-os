@@ -1663,6 +1663,18 @@ export type AgentSpawnerConfig = {
    * agent reads these bindings with the spawner creator's authority.
    */
   env: Record<string, WorkpieceId>,
+
+  /**
+   * Whether agents spawned by this spawner may use the `createWorktree` tool. Off by default:
+   * spawned agents are started by code, often in reaction to external text, so they get the
+   * narrowest tool set. Enabling this lets a spawned agent mount a commit it learned about from a
+   * gatekeeper binding (e.g. a GitHub repository in `env`) and read, grep, edit and commit files
+   * through the worktree's `executeCode` API. Getting a commit *out* of the worktree still goes
+   * through the gatekeeper's own write actions (push, pull request), which remain subject to the
+   * workspace's approval rules -- this flag widens what the agent can read and stage, not what it
+   * can publish.
+   */
+  allowWorktrees?: boolean,
 };
 
 /**
