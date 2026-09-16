@@ -27,7 +27,7 @@ import {
   type NotionPageResponse,
 } from "./notion-api";
 import type { RpcStub } from "cloudflare:workers";
-import type { ActionDescription, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import type { ActionDescription, ActionKind, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   NotionComment,
   NotionDatabaseSchema,
@@ -674,6 +674,44 @@ export function observation(title: string, description: string): ObservationDesc
 // ---------------------------------------------------------------------------------------------
 // Action descriptions
 
+/**
+ * Action kinds, for auto-approval rules. The tag is the stable key a user's per-connection
+ * "always approve" rule matches on; the label is what that rule shows in the UI.
+ *
+ * Every action carries `autoApprovable: true`; what differs is which kinds each gatekeeper is
+ * willing to *offer*. Two gates sit above this either way: the user must opt in to a kind on a
+ * given connection before anything auto-applies, and an item binding reaches only the one page or
+ * database it was connected to.
+ *
+ * A workspace binding has no such boundary, so it offers only the additive kinds
+ * (NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS). Standing permission to rewrite titles, overwrite
+ * properties or trash pages anywhere in a workspace is not something to put on the menu, however
+ * clearly the UI labels it — a mistake there is unbounded, and the agent choosing the target is
+ * exactly what the approval step exists to check. Bind to the specific database instead.
+ *
+ * Every action is revertible except `addComment` (the Notion public API cannot delete comments).
+ */
+export const NOTION_ACTION_KINDS = {
+  appendContent: { tag: "notion.appendContent", label: "Append content to a Notion page" },
+  setTitle: { tag: "notion.setTitle", label: "Rename a Notion page" },
+  setProperties: { tag: "notion.setProperties", label: "Update Notion page properties" },
+  setIcon: { tag: "notion.setIcon", label: "Change a Notion page icon" },
+  archive: { tag: "notion.archive", label: "Move a Notion page to trash" },
+  restore: { tag: "notion.restore", label: "Restore a Notion page from trash" },
+  addComment: { tag: "notion.addComment", label: "Comment on a Notion page" },
+  createPage: { tag: "notion.createPage", label: "Create a Notion page" },
+} as const satisfies Record<NotionAction["type"], ActionKind>;
+
+/** Offered by a page/database binding: every kind, bounded by the bound item. */
+export const NOTION_ITEM_AUTO_APPROVABLE_ACTIONS: ActionKind[] = Object.values(NOTION_ACTION_KINDS);
+
+/** Offered by a workspace binding: additive kinds only — see the note above. */
+export const NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS: ActionKind[] = [
+  NOTION_ACTION_KINDS.createPage,
+  NOTION_ACTION_KINDS.appendContent,
+  NOTION_ACTION_KINDS.addComment,
+];
+
 export function describeAction(action: NotionAction): ActionDescription {
   switch (action.type) {
     case "appendContent":
@@ -681,18 +719,24 @@ export function describeAction(action: NotionAction): ActionDescription {
         title: "Append content to Notion page",
         description: `Append the following Markdown to the page body:\n\n${truncate(action.markdown)}`,
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.appendContent,
       };
     case "setTitle":
       return {
         title: "Rename Notion page",
         description: `Change the page title to **${action.title}** (was “${action.previousTitle}”).`,
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.setTitle,
       };
     case "setProperties":
       return {
         title: "Update Notion page properties",
         description: `Update properties: ${Object.keys(action.properties).join(", ") || "(none)"}.`,
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.setProperties,
       };
     case "setIcon":
       return {
@@ -701,18 +745,24 @@ export function describeAction(action: NotionAction): ActionDescription {
           ? `Set the page icon to ${iconInputDisplay(action.icon)}.`
           : "Remove the page icon.",
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.setIcon,
       };
     case "archive":
       return {
         title: "Move Notion page to trash",
         description: "Move the page to the Notion trash (reversible).",
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.archive,
       };
     case "restore":
       return {
         title: "Restore Notion page from trash",
         description: "Restore the page from the Notion trash.",
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.restore,
       };
     case "addComment":
       return {
@@ -720,6 +770,8 @@ export function describeAction(action: NotionAction): ActionDescription {
         description: `Post a comment:\n\n${truncate(action.text)}`,
         // The Notion public API can't delete comments, so this can't be reverted automatically.
         implementsRevert: false,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.addComment,
       };
     case "createPage": {
       const where =
@@ -732,6 +784,8 @@ export function describeAction(action: NotionAction): ActionDescription {
         title: "Create Notion page",
         description: `Create a new page ${where} titled **${action.title ?? "Untitled"}**.`,
         implementsRevert: true,
+        autoApprovable: true,
+        actionKind: NOTION_ACTION_KINDS.createPage,
       };
     }
   }

@@ -18,6 +18,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionKind,
   type ApprovalQueue,
   type Gatekeeper,
   type GatekeeperConnectCallback,
@@ -47,6 +48,8 @@ import {
   type NotionOAuthGrant,
 } from "./notion-api";
 import {
+  NOTION_ITEM_AUTO_APPROVABLE_ACTIONS,
+  NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS,
   NotionStore,
   applyStoredAction,
   defaultPropertiesFromSchema,
@@ -745,8 +748,8 @@ export class NotionItemGatekeeperImpl extends DurableObject<Env, NotionItemGatek
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return NOTION_ITEM_AUTO_APPROVABLE_ACTIONS;
   }
 
   async startSession(
@@ -830,8 +833,8 @@ export class NotionWorkspaceGatekeeperImpl
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS;
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<NotionWorkspaceSession> {
