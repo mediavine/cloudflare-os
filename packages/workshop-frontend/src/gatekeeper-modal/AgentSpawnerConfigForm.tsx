@@ -59,11 +59,9 @@ export interface AgentSpawnerConfigFormProps {
   modelId: string | null
   env: SpawnerEnvRow[]
   envError: string | null
-  allowWorktrees: boolean
   onDisplayNameChange: (value: string) => void
   onModelIdChange: (id: string | null) => void
   onEnvChange: (env: SpawnerEnvRow[]) => void
-  onAllowWorktreesChange: (value: boolean) => void
   selectContainer?: PortalContainer
 }
 
@@ -73,11 +71,9 @@ export function AgentSpawnerConfigForm({
   modelId,
   env,
   envError,
-  allowWorktrees,
   onDisplayNameChange,
   onModelIdChange,
   onEnvChange,
-  onAllowWorktreesChange,
   selectContainer,
 }: AgentSpawnerConfigFormProps) {
   const updateRow = (index: number, updates: Partial<SpawnerEnvRow>) => {
@@ -166,23 +162,6 @@ export function AgentSpawnerConfigForm({
             )}
           </div>
         )}
-      </ConnectionConfigField>
-
-      <ConnectionConfigField
-        label="Worktrees"
-        description="Whether spawned agents may mount a git commit as a worktree to read, grep and edit files."
-      >
-        <div className="flex items-center gap-2">
-          <Checkbox
-            aria-label="Allow spawned agents to create worktrees"
-            checked={allowWorktrees}
-            onCheckedChange={(checked) => onAllowWorktreesChange(checked === true)}
-          />
-          <span className="text-[12px] leading-4 font-normal tracking-[-0.2px] text-kumo-subtle">
-            Allow <code className="font-mono">createWorktree</code>. Publishing a commit (push,
-            pull request) still goes through the repository connection's approval rules.
-          </span>
-        </div>
       </ConnectionConfigField>
     </section>
   )

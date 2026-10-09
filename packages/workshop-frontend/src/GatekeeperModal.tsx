@@ -219,7 +219,6 @@ export default function GatekeeperModal({
   const [spawnerDisplayName, setSpawnerDisplayName] = useState('')
   const [spawnerModelId, setSpawnerModelId] = useState<string | null>(null)
   const [spawnerEnv, setSpawnerEnv] = useState<SpawnerEnvRow[]>([])
-  const [spawnerAllowWorktrees, setSpawnerAllowWorktrees] = useState(false)
   const spawnerEnvError = validateSpawnerEnv(spawnerEnv)
 
   // Read only when the modal opens, so a caller that rebuilds the candidate array on every render
@@ -682,7 +681,6 @@ export default function GatekeeperModal({
       displayName: spawnerDisplayName.trim(),
       modelId: spawnerModelId,
       env: spawnerEnvFromRows(spawnerEnv),
-      ...(spawnerAllowWorktrees ? { allowWorktrees: true } : {}),
     }
 
     setCreating(true)
@@ -754,7 +752,7 @@ export default function GatekeeperModal({
         configuratorFrameState?.frame &&
         configuratorFrameState.accountId === selectedAccountId &&
         configuratorFrameState.resourceUrlPattern === resourceUrlPattern &&
-        configuratorSelectionReady !== false &&
+        configuratorSelectionReady === true &&
         !hasMissingResourceGrants,
       )
     }
@@ -869,11 +867,9 @@ export default function GatekeeperModal({
                     modelId={spawnerModelId}
                     env={spawnerEnv}
                     envError={spawnerEnvError}
-                    allowWorktrees={spawnerAllowWorktrees}
                     onDisplayNameChange={setSpawnerDisplayName}
                     onModelIdChange={setSpawnerModelId}
                     onEnvChange={setSpawnerEnv}
-                    onAllowWorktreesChange={setSpawnerAllowWorktrees}
                     selectContainer={selectPortalContainer}
                   />
                 )}

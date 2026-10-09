@@ -90,7 +90,9 @@ export type AppUiContext = {
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
 // Gatekeeper.getAgentCatalog() so the agent can see *what* is reachable through a session (e.g. the
 // titles of the Context Library collections it can search) without first reading everything. It is
-// shown to the agent as untrusted data, so entries carry no authority and are size-capped.
+// shown to the agent as untrusted data, so entries carry no authority and are size-capped. It is
+// delivered to every chat automatically and is not an observation, so it must not contain anything
+// that would need observer verification; reading an item through the session is where that happens.
 
 /** One discoverable item within a gatekeeper's session. */
 export type AgentCatalogEntry = {
@@ -394,6 +396,8 @@ export interface ResourceConfiguratorHost extends RpcTarget {
   /**
    * Tell Workshop whether the current selection is ready to submit.
    * Workshop uses this to determine whether `Add connection` button should be enabled/disabled.
+   * A custom frame must report `true` after it initializes successfully; generated configurator
+   * frames do this automatically when their optional readiness predicate is omitted.
    */
   setSelectionReady(ready: boolean): void;
 
@@ -726,8 +730,8 @@ export interface GatekeeperUser extends WorkerEntrypoint {
    * owner's gadgets like any other gatekeeper — as a Facet under the Overseer — and auto-provides
    * its session to the agent as an unnamed capsule. Because it is a normal Gatekeeper, the session
    * (Gatekeeper.startSession) and catalog (Gatekeeper.getAgentCatalog) run gadget-side in the
-   * gatekeeper's own worker with no round-trip back through this account DO; every read is still
-   * authorized as an observation via the ApprovalQueue, exactly like any gatekeeper.
+   * gatekeeper's own worker with no round-trip back through this account DO; every session read is
+   * still authorized as an observation via the ApprovalQueue, exactly like any gatekeeper.
    *
    * The returned class is imbued (via `ctx.props`) with whatever the account needs to serve the
    * singleton (e.g. the account id and sharing domain).
@@ -767,6 +771,13 @@ export interface GatekeeperUserVerifier extends WorkerEntrypoint {}
  *
  * The Gatekeeper executes as a Durable Object Facet, where it is a child of the Overseer. This
  * interface is exposed to the Overseer, not directly to the Gadget.
+ *
+ * A Gatekeeper may mint persistent stubs to itself with `this.ctx.restore(params)` and a
+ * `[restore](params)` method (see `ApprovalQueue.bindHook()`), e.g. for its worker's push handler
+ * to deliver events through. They keep restoring until the connection is removed from the
+ * workspace, and reach whatever `[restore]()` returns: return a target narrowed to the stub's
+ * purpose, never the Gatekeeper itself (which answers Overseer-only calls such as `applyAction()`),
+ * and keep the stubs within the gatekeeper's own worker.
  */
 export interface Gatekeeper<Session> extends DurableObject {
   /**
@@ -814,14 +825,16 @@ export interface Gatekeeper<Session> extends DurableObject {
    * Bounded, user-specific metadata the agent uses to discover entries reachable through this
    * gatekeeper's session, without paging the full session API. Implemented only by gatekeepers
    * whose session benefits from a discovery index (e.g. an agent singleton like the Context
-   * Library); most gatekeepers omit it. Catalog access is an observation, so the implementation
-   * must authorize it via `authorizer.authorizeObservation()` before returning metadata. Returns
-   * null when there is no catalog. Return the entries the agent most needs first and pass them
-   * through `boundAgentCatalog()`, since both that clamp and the Workshop's drop from the tail.
+   * Library); most gatekeepers omit it. The Workshop loads the catalog into every chat's prompt on
+   * every turn, so it is not an observation and must not contain anything that would need observer
+   * verification: the item's title and description are all that is revealed, and reading the item
+   * through the session is where the observation happens. Return null only when this gatekeeper has
+   * no catalog at all: the Workshop then stops asking this connection until the workspace next
+   * restarts. A catalog that is empty right now is `{entries: []}`. Return the entries the agent
+   * most needs first and pass them through `boundAgentCatalog()`, since both that clamp and the
+   * Workshop's drop from the tail.
    */
-  getAgentCatalog?(
-    authorizer: RpcStub<ObservationAuthorizer>,
-  ): Promise<AgentCatalog | null>;
+  getAgentCatalog?(): Promise<AgentCatalog | null>;
 
   /**
    * Informs the gatekeeper that a new user is being added to the Gadget with the potential to see
@@ -1180,6 +1193,9 @@ export type ObservationDescription = {
    */
   description: string;
 
+  /** Values shown literally after `description`, as in `ActionDescription.fields`. */
+  fields?: ActionField[];
+
   // ----------------------------------------------------------------------------
   // Policy hints
   //
@@ -1198,14 +1214,32 @@ export type ObservationDescription = {
    * - Every collaborator must pass this gatekeeper's `addObserver()` to open the gadget, so a
    *   gatekeeper whose `addObserver()` always throws makes the gadget effectively unshareable
    *   once it has made one of these observations.
-   * - Once observed, the gadget enters a restricted mode: no more actions or public-web fetches,
-   *   only observations, so the gadget cannot leak the data through other gatekeepers.
+   * - Once observed, the gadget enters a restricted mode: no public-web fetches, and every action
+   *   requires manual approval -- auto-approval rules are suspended. The approver is shown the
+   *   action's full `description` and is responsible for checking it contains none of the
+   *   restricted data. An action whose description is not complete
+   *   (`ActionDescription.descriptionIsComplete`) is accepted and flagged to the approver; only
+   *   git pushes are refused. The kernel does not restrict which connections may be acted on.
    *
    * TODO(someday): The restricted mode is a blunt instrument. It should be possible to perform
-   *   actions whose visibility is limited to people verified to have access to the same data,
-   *   but this requires a more complex policy framework to compute.
+   *   actions whose visibility is limited to people verified to have access to the same data: an
+   *   action should declare who can see its effects, and each restricted producer verify that
+   *   every such person can already see the data.
    */
   containsRestrictedData?: boolean;
+
+  /**
+   * If true, then once any observation carrying this flag is authorized, only collaborators the
+   * owner added directly keep access: share links stop granting anything (none can be created,
+   * copied, or redeemed), and people who joined through a link or through another collaborator
+   * lose access, restarting the gadget if any are present. After that, only the owner can add
+   * collaborators, one at a time. Those who remain are still subject to `addObserver()`
+   * verification on every open.
+   *
+   * Typically paired with `containsRestrictedData`, for data sources whose own sharing model
+   * requires each recipient to be granted access individually.
+   */
+  ownerInvitesOnly?: boolean;
 
   /**
    * If present, then this observation includes data that must not be revealed to the given
@@ -1227,6 +1261,46 @@ export type ObservationDescription = {
    */
   excludeObservers?: string[];
 }
+
+/** The language a `text` action field is written in, named so the approver knows how it is read. */
+export type ActionFieldSyntax = "markdown" | "html" | "sql";
+
+/**
+ * One value an approver reviews, carried as data so surfaces show it literally. `label` is the
+ * gatekeeper's own name for the value; everything else is the value as the action will send it.
+ */
+export type ActionField = {
+  /** The gatekeeper's name for the value, such as "Body" or "To". Plain text. */
+  label: string;
+
+  /**
+   * Present when `value` or `items` is not the whole value: the UTF-8 bytes shown and the bytes
+   * the whole value has. `shownBytes` of 0 means the field was omitted for lack of room.
+   */
+  truncated?: { shownBytes: number; totalBytes: number };
+} & (
+  /** A short single-line value, such as an ID or an address. */
+  | { kind: "inline"; value: string }
+  /** Text to read in full, line breaks included, optionally in a named language. */
+  | { kind: "text"; value: string; syntax?: ActionFieldSyntax }
+  /** Pretty-printed JSON, with every invisible character escaped so the text shows exactly. */
+  | { kind: "json"; value: string }
+  /** Short single-line values, one per row. */
+  | { kind: "list"; items: string[] }
+  /**
+   * Bytes named rather than shown. `origin` says where they come from: `"provider"` bytes are
+   * re-sent unchanged from the same provider, `"agent"` bytes come from this workspace and so
+   * leave the description incomplete.
+   */
+  | {
+    kind: "file";
+    name: string;
+    mediaType: string;
+    size: number;
+    sha256?: string;
+    origin: "provider" | "agent";
+  }
+);
 
 /**
  * A stable, machine-readable tag for an action paired with its human-readable display name; the two
@@ -1254,9 +1328,30 @@ export type ActionDescription = {
   /**
    * A complete description of the action to be taken, in Markdown-formatted natural language.
    * This will be displayed to the approver. It must include all details that might be relevant to
-   * consider before approving.
+   * consider before approving; see `descriptionIsComplete` for the standard this is held to.
+   * Values the approver reviews are better carried in `fields`, leaving this the gatekeeper's own
+   * prose.
    */
   description: string;
+
+  /**
+   * The values the approver reviews, as typed data shown literally after `description`: never
+   * rendered as Markdown, so a value needs no escaping to display as exactly itself.
+   */
+  fields?: ActionField[];
+
+  /**
+   * The gatekeeper's assertion that `description` and `fields` together reproduce, verbatim, every
+   * piece of content originating in this workspace that applying the action will write or send:
+   * bodies, field values, identifiers, serialized arguments. Bytes the gatekeeper re-sends
+   * unchanged from the same provider may instead be named by size and digest, as a `file` field
+   * with `origin: "provider"`. A provisional ID standing for something this workspace creates
+   * counts as shown when the description says the gatekeeper sends the provider's ID in its place.
+   * Absent means incomplete: a summary, a truncated field, or opaque bytes the approver cannot read
+   * as text. A push (`pushedCommits`) is never complete. Approval surfaces tell the approver when
+   * this is absent; an incomplete description is never refused for that reason.
+   */
+  descriptionIsComplete?: boolean;
 
   /**
    * If present, applying this action will push the named commits to the remote resource this
@@ -1547,9 +1642,14 @@ export interface GitCache extends RpcTarget {
   buildPack(): Promise<ReadableStream<Uint8Array>>;
 
   /**
-   * Consumes a standard git packfile and inserts all the objects within into the git cache. This
-   * is exactly equivalent to if the Gatekeeper decoded the packfile itself and `put()` each object
-   * into the cache.
+   * Consumes a standard git packfile, storing each object in it as `put()` would, and returns
+   * the oids of those now in the cache. An object too large to store is measured and left out of
+   * the result rather than thrown on, which is how a `gitPull()` notices it.
+   *
+   * The pack is decoded in one pass, so a delta must follow its base, as in every pack
+   * `git upload-pack` sends. Objects are stored as the pack streams in, and its commits last,
+   * once the rest has verified and been stored: a pack that fails can leave some of its objects
+   * stored, but not a commit without the trees that came with it.
    */
   consumePack(pack: ReadableStream<Uint8Array>): Promise<GitOid[]>;
 
