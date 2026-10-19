@@ -442,8 +442,8 @@ export class GatekeeperUserImpl
 // ---------------------------------------------------------------------------
 // Verifier
 
-// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` refuses
-// everyone.
+// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` admits
+// everyone without checking (Mediavine fork).
 @validateRpc()
 export class McpPortalVerifier
   extends WorkerEntrypoint<Env>

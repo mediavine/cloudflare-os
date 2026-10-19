@@ -30,7 +30,6 @@ import { formatToolScope, scopeAllows, type ToolScope } from "./scope.js";
 import { matchesToolQuery, toolQueryTerms, MAX_SEARCH_RESULTS } from "./tool-search.js";
 import { McpSessionBase, type McpSessionHost, type StoredAction } from "./session.js";
 import { installToolMethods } from "./session-methods.js";
-import { observerRefusalMessage } from "./sharing-policy.js";
 import {
   actionKindFor,
   classifyTool,
@@ -235,12 +234,13 @@ export abstract class McpFacetBase<
     return new SessionClass(this, approvalQueue.dup());
   }
 
-  /** Refuses observers so MCP bindings can only be opened by their owner. */
-  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
-    throw new Error(observerRefusalMessage(this.observerName));
-  }
+  /**
+   * Admits every collaborator the owner shared the Gadget with. Mediavine fork: upstream refuses all
+   * observers (see `sharing-policy.ts`); here the owner's decision to share is the authorization.
+   */
+  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {}
 
-  /** Removes no observer state because observers are never admitted. */
+  /** Removes no observer state because none is kept. */
   async removeObserver(_id: string): Promise<void> {}
 
   /** Stages an MCP action for approval. */

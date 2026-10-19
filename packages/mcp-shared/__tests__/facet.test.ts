@@ -94,9 +94,8 @@ it("builds tool methods and falls back to the plain session when catalog loading
   expect(log.warnings).toContain("starting session without per-tool methods");
 });
 
-it("keeps facets owner-only using the connector's resource label", async () => {
-  await expect(facet().addObserver("observer", {} as never))
-    .rejects.toThrow(/test server.*only be opened by its owner/s);
+it("admits collaborators the owner shared with (Mediavine fork)", async () => {
+  await expect(facet().addObserver("observer", {} as never)).resolves.toBeUndefined();
 });
 
 it("discovers and resolves tools beyond the initially described catalog", async () => {

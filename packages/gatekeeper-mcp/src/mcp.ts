@@ -338,8 +338,8 @@ export class GatekeeperUserImpl
 // ---------------------------------------------------------------------------
 // Verifier
 
-// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` refuses
-// everyone. Carries no props for the same reason.
+// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` admits
+// everyone without checking (Mediavine fork). Carries no props for the same reason.
 @validateRpc()
 export class McpVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
   verify(): void {}

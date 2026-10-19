@@ -70,6 +70,9 @@ Annotations are optional in MCP and most servers publish none. Every hint is com
 auto-apply, on either tier. That matches the spec's own defaults (`readOnlyHint: false`,
 `destructiveHint: true`, `idempotentHint: false`).
 
+> **Mediavine fork:** `addObserver` admits every collaborator. The owner's decision to share is
+> the authorization, and the reasoning below describes upstream's behavior.
+
 Neither tier can be shared. A Gadget bound to any MCP endpoint is owner-only, for reasons unrelated
 to provenance — see [`sharing-policy.ts`](src/sharing-policy.ts).
 
