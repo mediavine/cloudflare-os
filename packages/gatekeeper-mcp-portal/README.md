@@ -194,6 +194,9 @@ tier is `byo` unless a deployment sets `MCP_PORTAL_TRUST_ANNOTATIONS=true`. That
 "trusted server" assertion MCP's guidance asks for, and it has to be about the upstreams themselves,
 not just the portal in front of them.
 
+> **Mediavine fork:** `addObserver` admits every collaborator. The owner's decision to share is
+> the authorization, and the reasoning below describes upstream's behavior.
+
 `addObserver` refuses everyone, as it does for user-supplied endpoints. Reaching the portal is not
 the same as being allowed to see a particular tool result, and the Gadget runs on the owner's
 credentials regardless. A sharper check is available here than for a bare endpoint —

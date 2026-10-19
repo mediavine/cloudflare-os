@@ -174,6 +174,9 @@ produce. Every call records which side classified it (`McpToolInfo.classifiedBy`
 find each one taken on the server's word. See `tools.ts` in `@gadgets/mcp-shared` for the tier
 rules.
 
+> **Mediavine fork:** `addObserver` admits every collaborator. The owner's decision to share is
+> the authorization, and the reasoning below describes upstream's behavior.
+
 A Gadget bound to an MCP server can only be opened by its owner: `addObserver` refuses
 unconditionally. Being able to authenticate to a server is not evidence of being allowed to see what
 the *owner* read from it, and the Gadget runs on the owner's credentials throughout. Writes still
