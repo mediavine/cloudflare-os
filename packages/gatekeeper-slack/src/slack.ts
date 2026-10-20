@@ -1015,6 +1015,11 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
   // #prepareConversationObservation). Verified observers are remembered (their verifier stored) so the
   // forward-exclusion check can run. The overseer re-runs addObserver on every open, catching loss
   // of access promptly.
+  //
+  // Mediavine fork: only the workspace-membership check remains. The owner's decision to share is the
+  // authorization for conversation content, so addObserver no longer checks every tracked
+  // conversation (one rate-limited Slack call each, on every open, which left large workspaces
+  // spinning for minutes) and new conversations no longer exclude observers.
 
   #observerKey(id: string): string { return `observer:${id}`; }
   #trackedConversationKey(id: string): string { return `trackedConversation:${id}`; }
@@ -1024,23 +1029,9 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
         this.#trackedConversationKey(conversationId)) === "observed";
   }
 
-  #listTrackedConversations(): string[] {
-    let prefix = "trackedConversation:";
-    return [...this.ctx.storage.kv.list<TrackedConversationState>({ prefix })]
-        .map(([key]) => key.slice(prefix.length));
-  }
-
-  *#listObservers(): IterableIterator<[string, Fetcher<SlackVerifierApi>]> {
-    let prefix = "observer:";
-    for (let [key, verifier] of this.ctx.storage.kv.list<Fetcher<SlackVerifierApi>>({ prefix })) {
-      yield [key.slice(prefix.length), verifier];
-    }
-  }
-
-  // Marks not-yet-observed conversations pending and returns the current observers who cannot access
-  // one of them, plus a commit() promoting them to observed. Conversations stay pending (and are
-  // rechecked on retry) until commit() runs, so an observation the overseer blocks is not recorded
-  // as revealed.
+  // Marks not-yet-observed conversations pending and returns a commit() promoting them to observed.
+  // Conversations stay pending until commit() runs, so an observation the overseer blocks is not
+  // recorded as revealed. Mediavine fork: never excludes observers (see the class comment).
   async #prepareConversationObservation(conversationIds: string[]):
       Promise<{ excludeObservers?: string[]; commit(): void }> {
     let pending = [...new Set(conversationIds)].filter(id => !this.#isConversationObserved(id));
@@ -1051,14 +1042,7 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
         this.ctx.storage.kv.put<TrackedConversationState>(key, "pending");
       }
     }
-    let excluded: string[] = [];
-    let teamId = await this.#api().workspaceTeamId();
-    for (let [id, verifier] of this.#listObservers()) {
-      let access = await mapWithConcurrency(pending, cid => verifier.hasConversationAccess(cid, teamId));
-      if (!access.every(hasAccess => hasAccess)) excluded.push(id);
-    }
     return {
-      excludeObservers: excluded.length > 0 ? excluded : undefined,
       commit: () => {
         for (let id of pending) {
           this.ctx.storage.kv.put<TrackedConversationState>(this.#trackedConversationKey(id), "observed");
@@ -1090,23 +1074,9 @@ export class SlackWorkspaceGatekeeperImpl extends DurableObject<Env, SlackWorksp
           "This collaborator is not a member of the connected Slack workspace, so they cannot be " +
           "allowed to observe it.");
     }
-    // Loop until no new conversations appear mid-check (concurrent observations may add more).
-    let checked = new Set<string>();
-    while (true) {
-      let conversationIds = this.#listTrackedConversations().filter(cid => !checked.has(cid));
-      if (conversationIds.length === 0) {
-        this.ctx.storage.kv.put(this.#observerKey(id), verifier);
-        return;
-      }
-      let access = await mapWithConcurrency(
-          conversationIds, cid => verifier.hasConversationAccess(cid, boundTeamId));
-      if (access.some(hasAccess => !hasAccess)) {
-        throw new Error(
-            "This collaborator does not have access to a Slack conversation whose data this workspace " +
-            "has read, so they cannot be allowed to observe it.");
-      }
-      for (let cid of conversationIds) checked.add(cid);
-    }
+    // Mediavine fork: no per-conversation checks and no stored verifier (see the class comment).
+    // Drop any verifier stored before this fork change so nothing consults it.
+    this.ctx.storage.kv.delete(this.#observerKey(id));
   }
 
   async removeObserver(id: string): Promise<void> {
