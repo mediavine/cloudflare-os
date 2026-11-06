@@ -17,6 +17,7 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   stripTrailingSlashes,
+  workerVersionTag,
   type AccountDescription,
   type ActionKind,
   type ApprovalQueue,
@@ -51,8 +52,7 @@ import {
   type NotionOAuthGrant,
 } from "./notion-api";
 import {
-  NOTION_ITEM_AUTO_APPROVABLE_ACTIONS,
-  NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS,
+  AUTO_APPROVABLE_KINDS,
   NotionStore,
   applyStoredAction,
   defaultPropertiesFromSchema,
@@ -304,6 +304,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
           "databases you share. Build agents that draft documents, organize notes, or manage " +
           "database records.",
     };
+  }
+
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
   }
 
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>): Promise<{ url: string }> {
@@ -767,7 +771,7 @@ export class NotionItemGatekeeperImpl extends DurableObject<Env, NotionItemGatek
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return NOTION_ITEM_AUTO_APPROVABLE_ACTIONS;
+    return AUTO_APPROVABLE_KINDS;
   }
 
   async startSession(
@@ -852,7 +856,7 @@ export class NotionWorkspaceGatekeeperImpl
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS;
+    return AUTO_APPROVABLE_KINDS;
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<NotionWorkspaceSession> {

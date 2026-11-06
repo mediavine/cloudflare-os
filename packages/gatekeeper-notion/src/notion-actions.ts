@@ -32,7 +32,12 @@ import {
   type ActionDescriptionBuilder,
   buildDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
-import type { ActionDescription, ActionKind, ApprovalQueue, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import type {
+  ActionDescription,
+  ActionKind,
+  ApprovalQueue,
+  ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
 import type {
   NotionComment,
   NotionDatabaseSchema,
@@ -86,6 +91,11 @@ export type StoredActionRecord = {
   action: NotionAction;
   state: "pending" | "applied" | "reverted";
   submittedAt: number;
+  /**
+   * When the overseer first applied it, which proves it received the action even if the submit
+   * reply was lost (see stageAction).
+   */
+  applyStartedAt?: number;
   /** For appendContent revert: the IDs of the blocks created on apply. */
   appendedBlockIds?: string[];
   /** For createPage: the real Notion page ID assigned on apply. */
@@ -681,44 +691,6 @@ export function observation(title: string, description: string): ObservationDesc
 // ---------------------------------------------------------------------------------------------
 // Action descriptions
 
-/**
- * Action kinds, for auto-approval rules. The tag is the stable key a user's per-connection
- * "always approve" rule matches on; the label is what that rule shows in the UI.
- *
- * Every action carries `autoApprovable: true`; what differs is which kinds each gatekeeper is
- * willing to *offer*. Two gates sit above this either way: the user must opt in to a kind on a
- * given connection before anything auto-applies, and an item binding reaches only the one page or
- * database it was connected to.
- *
- * A workspace binding has no such boundary, so it offers only the additive kinds
- * (NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS). Standing permission to rewrite titles, overwrite
- * properties or trash pages anywhere in a workspace is not something to put on the menu, however
- * clearly the UI labels it — a mistake there is unbounded, and the agent choosing the target is
- * exactly what the approval step exists to check. Bind to the specific database instead.
- *
- * Every action is revertible except `addComment` (the Notion public API cannot delete comments).
- */
-export const NOTION_ACTION_KINDS = {
-  appendContent: { tag: "notion.appendContent", label: "Append content to a Notion page" },
-  setTitle: { tag: "notion.setTitle", label: "Rename a Notion page" },
-  setProperties: { tag: "notion.setProperties", label: "Update Notion page properties" },
-  setIcon: { tag: "notion.setIcon", label: "Change a Notion page icon" },
-  archive: { tag: "notion.archive", label: "Move a Notion page to trash" },
-  restore: { tag: "notion.restore", label: "Restore a Notion page from trash" },
-  addComment: { tag: "notion.addComment", label: "Comment on a Notion page" },
-  createPage: { tag: "notion.createPage", label: "Create a Notion page" },
-} as const satisfies Record<NotionAction["type"], ActionKind>;
-
-/** Offered by a page/database binding: every kind, bounded by the bound item. */
-export const NOTION_ITEM_AUTO_APPROVABLE_ACTIONS: ActionKind[] = Object.values(NOTION_ACTION_KINDS);
-
-/** Offered by a workspace binding: additive kinds only — see the note above. */
-export const NOTION_WORKSPACE_AUTO_APPROVABLE_ACTIONS: ActionKind[] = [
-  NOTION_ACTION_KINDS.createPage,
-  NOTION_ACTION_KINDS.appendContent,
-  NOTION_ACTION_KINDS.addComment,
-];
-
 // Starts a description naming, by ID, the page an action writes to or under.
 function onPage(intro: string, pageId: string, label = "Page ID"): ActionDescriptionBuilder {
   const builder = buildDescription(intro).inline(label, pageId);
@@ -727,12 +699,71 @@ function onPage(intro: string, pageId: string, label = "Page ID"): ActionDescrip
     : builder;
 }
 
+const EDIT_PAGES: ActionKind = { tag: "edit-pages", label: "Edit page titles, properties and icons" };
+
+/**
+ * The kind of each action, which users' auto-approval rules key on, so a tag must never change.
+ * Appending is kept apart from edits that overwrite, and restoring apart from trashing.
+ */
+const ACTION_KINDS: Record<NotionAction["type"], ActionKind> = {
+  appendContent: { tag: "append-content", label: "Add content to pages" },
+  setTitle: EDIT_PAGES,
+  setProperties: EDIT_PAGES,
+  setIcon: EDIT_PAGES,
+  createPage: { tag: "create-pages", label: "Create pages and database rows" },
+  archive: { tag: "trash-pages", label: "Move pages to trash" },
+  restore: { tag: "restore-pages", label: "Restore pages from trash" },
+  addComment: { tag: "post-comments", label: "Comment on pages" },
+};
+
+// Moving a page to trash removes it (and its sub-pages) from every member's view, so it is never
+// auto-approvable.
+const NEVER_AUTO_APPROVABLE: NotionAction["type"] = "archive";
+
+// Every action may be applied without a person once the user has enabled its kind, except moving
+// a page to trash and storing an agent-chosen URL that Notion loads by itself: an external image
+// icon, shown wherever the page is, or a file in a files property (always external from here),
+// shown in gallery and board card previews. Either URL could carry page content to its host.
+// Emoji icons and cleared files properties stay auto-approvable.
+function isAutoApprovable(action: NotionAction): boolean {
+  switch (action.type) {
+    case NEVER_AUTO_APPROVABLE: return false;
+    case "setIcon": return !isExternalIcon(action.icon);
+    case "setProperties": return !hasExternalFiles(action.properties);
+    case "createPage": return !isExternalIcon(action.icon) && !hasExternalFiles(action.properties);
+    default: return true;
+  }
+}
+
+function isExternalIcon(icon: NotionIconInput | null | undefined): boolean {
+  return icon != null && "imageUrl" in icon;
+}
+
+function hasExternalFiles(properties: Record<string, NotionPropertyInput> | undefined): boolean {
+  return Object.values(properties ?? {}).some(input => input.type === "files" && input.files.length > 0);
+}
+
+/** The kinds an action can be auto-approved under. Every binding can submit all of them. */
+export const AUTO_APPROVABLE_KINDS: ActionKind[] = [...new Set(
+  (Object.keys(ACTION_KINDS) as NotionAction["type"][])
+    .filter(type => type !== NEVER_AUTO_APPROVABLE)
+    .map(type => ACTION_KINDS[type]),
+)];
+
 /**
  * The approver's text, built so every value the agent supplied (page bodies, comments, titles,
  * property values, icons) is shown in full in a field, and the completeness claim is
- * the builder's.
+ * the builder's; plus the action's kind and auto-approval verdict.
  */
 export function describeAction(action: NotionAction): ActionDescription {
+  return {
+    ...describeActionText(action),
+    actionKind: ACTION_KINDS[action.type],
+    autoApprovable: isAutoApprovable(action),
+  };
+}
+
+function describeActionText(action: NotionAction): Omit<ActionDescription, "actionKind" | "autoApprovable"> {
   switch (action.type) {
     case "appendContent":
       return {
@@ -741,8 +772,6 @@ export function describeAction(action: NotionAction): ActionDescription {
           .verbatim("Content", action.markdown, "markdown")
           .finish(),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.appendContent,
       };
     case "setTitle":
       return {
@@ -752,8 +781,6 @@ export function describeAction(action: NotionAction): ActionDescription {
           .inline("New title", action.title)
           .finish(),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.setTitle,
       };
     case "setProperties":
       return {
@@ -762,8 +789,6 @@ export function describeAction(action: NotionAction): ActionDescription {
           .json("Properties", action.properties)
           .finish(),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.setProperties,
       };
     case "setIcon":
       return {
@@ -772,24 +797,18 @@ export function describeAction(action: NotionAction): ActionDescription {
           ? onPage("Set the page icon.", action.pageId).inline("Icon", iconInputDisplay(action.icon)).finish()
           : onPage("Remove the page icon.", action.pageId).finish()),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.setIcon,
       };
     case "archive":
       return {
         title: "Move Notion page to trash",
         ...onPage("Move the page to the Notion trash (reversible).", action.pageId).finish(),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.archive,
       };
     case "restore":
       return {
         title: "Restore Notion page from trash",
         ...onPage("Restore the page from the Notion trash.", action.pageId).finish(),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.restore,
       };
     case "addComment":
       return {
@@ -797,8 +816,6 @@ export function describeAction(action: NotionAction): ActionDescription {
         ...onPage("Post a comment.", action.pageId).verbatim("Comment", action.text).finish(),
         // The Notion public API can't delete comments, so this can't be reverted automatically.
         implementsRevert: false,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.addComment,
       };
     case "createPage": {
       const { parent } = action;
@@ -840,8 +857,6 @@ export function describeAction(action: NotionAction): ActionDescription {
         title: "Create Notion page",
         ...builder.finish(),
         implementsRevert: true,
-        autoApprovable: true,
-        actionKind: NOTION_ACTION_KINDS.createPage,
       };
     }
   }
@@ -1142,6 +1157,10 @@ export async function stageAction(
   try {
     await approvalQueue.submitAction(id, describeAction(action));
   } catch (err) {
+    // An auto-approval can apply the action before the reply arrives, so a lost reply on an
+    // action the overseer has started applying proves it received it: failing would invite a
+    // repeated write, and deleting would take away its retry.
+    if (store.getAction(id)?.applyStartedAt !== undefined) return id;
     store.deleteAction(id);
     throw err;
   }
@@ -1151,9 +1170,20 @@ export async function stageAction(
 // ---------------------------------------------------------------------------------------------
 // Overseer-facing dispatch (called by the gatekeeper DO's applyAction/rejectAction/revertAction).
 
+/** Records that the overseer has started applying `record`, before anything reaches the provider. */
+function markApplyStarted(store: NotionStore, record: StoredActionRecord): void {
+  if (record.applyStartedAt !== undefined) return;
+  record.applyStartedAt = Date.now();
+  store.putAction(record);
+}
+
 export async function applyStoredAction(store: NotionStore, id: number): Promise<void> {
   const record = store.getAction(id);
   if (!record) throw new Error(`Unknown action: ${id}`);
+  // The overseer records completion only after this returns, so a lost reply or a restart in
+  // between re-delivers an apply that already ran; running it again would repeat the write.
+  if (record.state === "applied") return;
+  markApplyStarted(store, record);
   await applyNotionAction(store, record);
 }
 

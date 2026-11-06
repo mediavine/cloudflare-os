@@ -24,6 +24,7 @@ import type {
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
 import {
   connectHandoffPageHtml, errorPageHtml, htmlResponse, INVALID_LINK_HTML,
 } from "@gadgets/gatekeeper-kit/connect-pages";
@@ -39,7 +40,6 @@ import {
 } from "@gadgets/gatekeeper-kit/credentials";
 import { notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import { commitStagedCredentials, discardStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
-import { probeAccess } from "@gadgets/gatekeeper-kit/http-errors";
 import {
   OAuthClient,
   OAuthResponseError,
@@ -53,7 +53,6 @@ import { PreviewOAuth, PreviewOAuthConfigurationError } from "@gadgets/gatekeepe
 import { XApi, requireData, type XEnvelope } from "./x-api";
 import {
   RECONNECT_MESSAGE,
-  accountSource,
   withinReadLimit,
   type PublicGrant,
   type ReadReservation,
@@ -110,8 +109,12 @@ type ConnectAttempt = {
   redirectUri: string;
   /** The connection generation the attempt began under; a disconnect or reconnect since wins. */
   startedUnder: string;
-  /** Whether the grant is staged rather than made live, fixed when the attempt starts. */
-  reconnect: boolean;
+  /**
+   * Set when the link was minted to connect a new account, whose grant goes live. Absent -- a
+   * reconnect's link, or one minted before this was recorded -- stages the grant: the safe way for a
+   * bearer link to land on an account that may already be connected.
+   */
+  firstConnect?: true;
   /** The scopes this attempt asked for, recorded on the grant if X's response omits them. */
   scopes: string[];
 };
@@ -281,6 +284,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     };
   }
 
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
+  }
+
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>,
                        options?: GatekeeperConnectOptions): Promise<{ url: string }> {
     // `options.scopes` asks for a sign-in grant, which this gatekeeper does not offer.
@@ -327,7 +334,8 @@ export class UserAccount extends DurableObject<Env> {
     if (!this.#creds.stored()) await this.ctx.storage.setAlarm(Date.now() + CONNECT_TIMEOUT_MS);
     this.ctx.storage.kv.put("callback", callback);
     this.ctx.storage.kv.put<string[]>("requestedScopes", requestedScopes);
-    putInitiation(this.ctx.storage.kv, initiationNonce, Date.now());
+    putInitiation<Pick<ConnectAttempt, "firstConnect">>(this.ctx.storage.kv, initiationNonce, Date.now(),
+      { firstConnect: true });
   }
 
   /** Arms a reconnect or `ensureResources` flow asking for `requestedScopes`. */
@@ -347,7 +355,6 @@ export class UserAccount extends DurableObject<Env> {
       codeVerifier: pkce.codeVerifier,
       redirectUri,
       startedUnder: this.#creds.connectionGeneration(),
-      reconnect: this.#creds.stored() !== undefined,
       scopes,
     });
     if (oauthNonce === null) return null;
@@ -381,7 +388,7 @@ export class UserAccount extends DurableObject<Env> {
     try {
       identity = await fetchIdentity(grant.accessToken);
     } catch (error) {
-      if (!attempt.reconnect) await this.#revokeGrant(grant);
+      if (attempt.firstConnect) await this.#revokeGrant(grant);
       throw new Error("Could not read which X account authorized this connection. Please try again.",
         { cause: error });
     }
@@ -393,7 +400,7 @@ export class UserAccount extends DurableObject<Env> {
     }
 
     let handoff: ConnectHandoff;
-    if (attempt.reconnect) {
+    if (!attempt.firstConnect) {
       const pinned = kv.get<StoredIdentity>("identity");
       if (pinned !== undefined && pinned.id !== identity.id) {
         await this.#revokeGrant(grant);
@@ -520,6 +527,16 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   /**
+   * The X user this connection is pinned to, from storage alone: the pin never moves, so comparing
+   * against it needs no read from X. A disconnected account names nobody.
+   */
+  async getPinnedUserId(): Promise<string> {
+    const stored = this.ctx.storage.kv.get<StoredIdentity>("identity");
+    if (stored === undefined) throw new CredentialsExpiredError(RECONNECT_MESSAGE);
+    return stored.id;
+  }
+
+  /**
    * Reserves `count` billable reads against today's limit. X bills per resource per UTC day, so the
    * limit counts the same way and resets at UTC midnight.
    */
@@ -623,7 +640,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
       throw new Error("Not an X link this gatekeeper can bind: expected a post, List, or profile link, " +
         `or ${RESOURCES.account.title} (https://x.com/settings/account).`);
     }
-    const base = { userObjectId: this.ctx.props.userObjectId };
+    const base = { userObjectId: this.ctx.props.userObjectId, redactsActionPreviews: true as const };
     const props: XGatekeeperImplProps =
       parsed.kind === "account" ? { ...base, resourceKind: "account" }
       : parsed.kind === "post" ? { ...base, resourceKind: "post", postId: parsed.postId }
@@ -680,7 +697,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     return { url: `${getBaseUrl(this.env)}/${this.ctx.props.userObjectId}/${initiationNonce}` };
   }
 
-  /** Mints a verifier for this account; see `XGatekeeperImpl.addObserver`. */
+  /** Mints a verifier for this account; see `XGatekeeperImpl.verifyObserverAccess`. */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     const props: XVerifierProps = { userObjectId: this.ctx.props.userObjectId };
@@ -691,11 +708,10 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 // ---------------------------------------------------------------------------
 // Verifier
 //
-// Every binding admits observers by one rule (plans/x-gatekeeper.md §7): public reads need only an
-// X account of the observer's own, and owner-private reads -- bookmarks, likes, mute state,
-// private Lists, protected accounts' posts -- need the observer to be connected as the same X
-// user. A Post or List binding also checks, on every open, that the observer's own account can
-// see the bound post or List.
+// Every binding checks observers by one rule (plans/x-gatekeeper.md §7): public reads restrict
+// nothing, and reads private to the account -- bookmarks, likes, mute state, private Lists,
+// protected accounts' posts -- are for observers connected as the same X user only. The verifier
+// says which X user that is, without asking X.
 
 type XVerifierProps = {
   userObjectId: string;
@@ -711,28 +727,13 @@ export class XVerifier extends WorkerEntrypoint<Env, XVerifierProps> implements 
     const account = this.#account();
     try {
       // The identity outlives the grant, so it speaks for the observer only while the connection's
-      // credentials still work: a grant X refused for good answers null.
+      // credentials still work: a grant X refused for good, or a disconnect, answers null.
       await account.getCredentials();
-      return (await account.getIdentity()).id;
-    } catch {
-      return null;
+      return await account.getPinnedUserId();
+    } catch (error) {
+      if (isCredentialsExpired(error)) return null;
+      throw error;
     }
-  }
-
-  async canViewPost(postId: string): Promise<boolean> {
-    return await this.#probe(api => api.get<unknown>(`/2/tweets/${postId}`, {}), "post");
-  }
-
-  async canViewList(listId: string): Promise<boolean> {
-    return await this.#probe(api => api.get<unknown>(`/2/lists/${listId}`, {}), "List");
-  }
-
-  /** Runs one access probe with the observer's own token. Probes count against their read limit. */
-  async #probe(lookup: (api: XApi) => Promise<XEnvelope<unknown>>, what: string): Promise<boolean> {
-    const source = accountSource(this.ctx.exports, this.ctx.props.userObjectId);
-    return await probeAccess(async () => requireData(await withinReadLimit(this.#account(), 1,
-      () => source.run(creds => lookup(new XApi(creds.accessToken)), { replayable: true }),
-      "The collaborator's X connection"), what));
   }
 }
 

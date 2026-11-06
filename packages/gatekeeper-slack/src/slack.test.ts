@@ -78,10 +78,10 @@ describe("Slack resource binding identity", () => {
     await user.getGatekeeperClassFor("https://app.slack.com/client/TTWO");
     await user.getGatekeeperClassFor("https://app.slack.com/client/TONE/CONE");
     expect(ctx.exports.SlackWorkspaceGatekeeperImpl).toHaveBeenCalledWith({
-      props: { userObjectId: "account", teamId: "TTWO" },
+      props: { userObjectId: "account", teamId: "TTWO", reportsSubresources: true },
     });
     expect(ctx.exports.SlackConversationGatekeeperImpl).toHaveBeenCalledWith({
-      props: { userObjectId: "account", teamId: "TONE", conversationId: "CONE" },
+      props: { userObjectId: "account", teamId: "TONE", conversationId: "CONE", reportsSubresources: true },
     });
     await expect(user.getGatekeeperClassFor("https://app.slack.com/client/EORG"))
         .rejects.toThrow("not an enterprise");
@@ -193,32 +193,28 @@ describe("Slack org observer isolation", () => {
     expect(observer.hasWorkspaceAccess).toHaveBeenCalledWith("TTWO");
   });
 
-  it("admits workspace members without per-conversation checks or exclusions (Mediavine fork)", async () => {
+  // Mediavine fork: a workspace binding checks only workspace membership; the owner's decision to
+  // share is the authorization for conversation content.
+  it("checks only workspace membership, not conversations earlier reads recorded", async () => {
     let ctx = context({ userObjectId: "account", teamId: "TTWO" });
     let binding = new SlackWorkspaceGatekeeperImpl(ctx as never, {} as never);
     ctx.storage.kv.put("trackedConversation:COLD", "observed");
-    ctx.storage.kv.put("observer:observer", { stale: true });
+    ctx.storage.kv.put("trackedConversation:CPENDING", "pending");
     let observer = { hasWorkspaceAccess: vi.fn(async () => true),
       hasConversationAccess: vi.fn(async () => false) };
-    await binding.addObserver("observer", observer as never);
+    await expect(binding.addObserver("observer", observer as never)).resolves.toBeUndefined();
     expect(observer.hasWorkspaceAccess).toHaveBeenCalledWith("TTWO");
-    expect(ctx.storage.kv.get("observer:observer")).toBeUndefined();
-    let queue = { authorizeObservation: vi.fn(async () => undefined) };
-    await binding.authorizeConversationObservation(queue as never, ["CNEW"], { title: "Read", description: "Test" });
     expect(observer.hasConversationAccess).not.toHaveBeenCalled();
-    expect(queue.authorizeObservation).toHaveBeenCalledWith(expect.objectContaining({
-      excludeObservers: undefined,
-    }));
-    expect(ctx.storage.kv.get("trackedConversation:CNEW")).toBe("observed");
   });
 
-  it("keeps blocked observations pending so they are not recorded as revealed", async () => {
-    let ctx = context({ userObjectId: "account", teamId: "TONE" });
-    let binding = new SlackWorkspaceGatekeeperImpl(ctx as never, {} as never);
-    let queue = { authorizeObservation: vi.fn(async () => { throw new Error("blocked"); }) };
-    await expect(binding.authorizeConversationObservation(
-        queue as never, ["CNEW"], { title: "Read", description: "Test" })).rejects.toThrow("blocked");
-    expect(ctx.storage.kv.get("trackedConversation:CNEW")).toBe("pending");
+  it("verifies a workspace binding's conversation reads against workspace membership only", async () => {
+    let binding = new SlackWorkspaceGatekeeperImpl(
+        context({ userObjectId: "account", teamId: "TTWO" }) as never, {} as never);
+    let checkSubresourceAccess = vi.fn(async (ids: string[]) => ids.map(() => true));
+    await expect(binding.verifyObserverAccess([{ id: "observer", verifier: { checkSubresourceAccess } as never }],
+        ["workspace/TTWO/conversation/CPRIVATE", "workspace/TTWO/conversation/CDM", "workspace/TTWO"]))
+        .resolves.toEqual({ allowedObserverIds: ["observer"] });
+    expect(checkSubresourceAccess).toHaveBeenCalledWith(["workspace/TTWO"]);
   });
 
   it("passes workspace identity into conversation and thread observer checks", async () => {

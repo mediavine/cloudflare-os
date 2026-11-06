@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  SUGGESTED_MODELS, type AiModelProvider, type GatewayModel, type GatewayModelCapabilities,
+  AUTO_ROUTER_MODEL_ID, SUGGESTED_MODELS, type AiModelProvider, type GatewayModel,
+  type GatewayModelCapabilities,
 } from "@gadgets/workshop-shared/api";
 import { serializeAdminConfig } from "../src/admin-config.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
@@ -164,11 +165,11 @@ describe("GatewayModels", () => {
     CF_AI_GATEWAY_API_TOKEN: "gateway-token",
     CF_AI_GATEWAY_PROVIDERS: providers,
   });
-  type Config = Pick<AdminConfig, "modelModes" | "addedProviders" | "addedModels" |
-      "userModelsEnabled" | "modelSettings" | "defaultReasoning">;
+  type Config = Pick<AdminConfig, "modelModes" | "addedProviders" | "providerOrder" |
+      "addedModels" | "modelOrder" | "userModelsEnabled" | "modelSettings" | "defaultReasoning">;
   const NO_CONFIG: Config = {
-    modelModes: {}, addedProviders: [], addedModels: [], userModelsEnabled: true,
-    modelSettings: {}, defaultReasoning: null,
+    modelModes: {}, addedProviders: [], providerOrder: [], addedModels: [], modelOrder: {},
+    userModelsEnabled: true, modelSettings: {}, defaultReasoning: null,
   };
   const gatewayModels = (config: Partial<Config> = {}, providers?: string) =>
       new GatewayModels(new AiGatewayConfig(gatewayEnv(providers)), { ...NO_CONFIG, ...config });
@@ -193,9 +194,12 @@ describe("GatewayModels", () => {
       ...Object.keys(SUGGESTED_MODELS.anthropic),
       ...Object.keys(SUGGESTED_MODELS.openai),
     ]);
-    expect(ids(models.list())).toEqual(ids(models.all.filter(model => model.mode === "enabled")));
-    expect(ids(models.list())).toContain("claude-opus-5-5");
-    expect(ids(models.list())).not.toContain("gpt-6-sol");
+    // Each enabled model is listed as exactly one kind.
+    expect([...ids(models.list("language")), ...ids(models.list("decision"))].toSorted())
+        .toEqual(ids(models.all.filter(model => model.mode === "enabled")).toSorted());
+    expect(ids(models.list("decision"))).toEqual(["@cf/cloudflare/clef", "@cf/cloudflare/clef-flash"]);
+    expect(ids(models.list("language"))).toContain("claude-opus-5-5");
+    expect(ids(models.list("language"))).not.toContain("gpt-6-sol");
   });
 
   // Chats, spawners, and preferences created before a model was hidden still name it. A catalog
@@ -212,7 +216,7 @@ describe("GatewayModels", () => {
   it("hides an enabled model: unlisted, still resolved", () => {
     const models = gatewayModels({ modelModes: { "claude-fable-5-1": "hidden" } });
     expect(models.get("claude-fable-5-1")).toMatchObject({ mode: "hidden", defaultMode: "enabled" });
-    expect(ids(models.list())).not.toContain("claude-fable-5-1");
+    expect(ids(models.list("language"))).not.toContain("claude-fable-5-1");
     expect(models.resolve("claude-fable-5-1")?.profile.name).toBe("Claude Fable 5.1");
     expect(() => models.refuseDisabled("claude-fable-5-1")).not.toThrow();
   });
@@ -222,7 +226,7 @@ describe("GatewayModels", () => {
     expect(models.get("claude-fable-5-1")).toMatchObject(
         { name: "Claude Fable 5.1", mode: "disabled", defaultMode: "enabled" });
     expect(ids(models.all)).toContain("claude-fable-5-1");
-    expect(ids(models.list())).not.toContain("claude-fable-5-1");
+    expect(ids(models.list("language"))).not.toContain("claude-fable-5-1");
     expect(models.resolve("claude-fable-5-1")).toBeUndefined();
     expect(() => models.refuseDisabled("claude-fable-5-1")).toThrow(new Error(DISABLED_MESSAGE));
   });
@@ -230,7 +234,7 @@ describe("GatewayModels", () => {
   it("enables a model the catalog hides, in its catalog position", () => {
     const models = gatewayModels({ modelModes: { "claude-opus-5": "enabled" } });
     expect(models.get("claude-opus-5")).toMatchObject({ mode: "enabled", defaultMode: "hidden" });
-    const listed = ids(models.list());
+    const listed = ids(models.list("language"));
     expect(listed.indexOf("claude-opus-5")).toBe(listed.indexOf("claude-fable-5-1") + 1);
   });
 
@@ -255,7 +259,7 @@ describe("GatewayModels", () => {
         'The "My Model" model can\'t be used: adding your own models is disabled on this ' +
         "deployment by an administrator."));
     // The gateway's own models are as they were.
-    expect(ids(off.list())).toEqual(ids(on.list()));
+    expect(ids(off.list("language"))).toEqual(ids(on.list("language")));
     expect(off.resolve("gpt-6-sol")).toStrictEqual(on.resolve("gpt-6-sol"));
   });
 
@@ -270,9 +274,48 @@ describe("GatewayModels", () => {
       provider: "anthropic", id: "claude-test", name: "Claude Test", contextWindow: 500000,
       mode: "enabled", defaultMode: "enabled", added: true,
     });
-    const listed = ids(models.list());
-    expect(listed.indexOf("claude-test")).toBe(listed.indexOf("claude-haiku-4-5") + 1);
+    const listed = ids(models.list("language"));
+    // Haiku 4.5 is hidden, so the last Anthropic catalog model the pickers list is Fable 5.1.
+    expect(listed.indexOf("claude-test")).toBe(listed.indexOf("claude-fable-5-1") + 1);
     expect(listed.indexOf("claude-test-2")).toBe(listed.indexOf("claude-test") + 1);
+  });
+
+  it("lists each provider's models in the admin's order, the rest after in their own", () => {
+    const hidden = "@cf/zai-org/glm-5.3-flash";
+    expect(SUGGESTED_MODELS.cloudflare[hidden]?.hidden).toBe(true);
+    const models = gatewayModels({
+      addedModels: ADDED,
+      // The added model first, then a hidden catalog model; a stale ID changes nothing.
+      modelOrder: { cloudflare: ["@cf/test/added", "@cf/test/removed", hidden] },
+    });
+    // Each provider's models stay together, and other providers keep their order.
+    expect(ids(models.all)).toEqual([
+      "@cf/test/added", hidden,
+      ...Object.keys(SUGGESTED_MODELS.cloudflare).filter(id => id !== hidden),
+      ...Object.keys(SUGGESTED_MODELS.anthropic), "claude-test", "claude-test-2",
+      ...Object.keys(SUGGESTED_MODELS.openai),
+    ]);
+    // The default model is the first one enabled.
+    expect(models.list("language")[0]?.id).toBe("@cf/test/added");
+  });
+
+  it("puts the default model wherever the provider order leads", () => {
+    const providers = "cloudflare-auto-router,cloudflare";
+    expect(gatewayModels({}, providers).list("language")[0]?.id).toBe(AUTO_ROUTER_MODEL_ID);
+    expect(gatewayModels({ providerOrder: ["cloudflare"] }, providers).list("language")[0]?.id)
+        .toBe(Object.keys(SUGGESTED_MODELS.cloudflare)[0]);
+  });
+
+  it("lists the providers in the admin's order, the rest after in catalog order", () => {
+    const models = gatewayModels({ providerOrder: ["openai", "anthropic"] });
+    expect(ids(models.all)).toEqual([
+      ...Object.keys(SUGGESTED_MODELS.openai),
+      ...Object.keys(SUGGESTED_MODELS.anthropic),
+      ...Object.keys(SUGGESTED_MODELS.cloudflare),
+    ]);
+    expect(models.providerSettings.map(({ provider }) => provider)).toEqual(
+        ["openai", "anthropic", "cloudflare-auto-router", "cloudflare", "google"]);
+    expect(models.addableProviders).toEqual(["openai", "anthropic", "cloudflare"]);
   });
 
   it("resolves an added model with its limits in the config", () => {
@@ -296,7 +339,7 @@ describe("GatewayModels", () => {
 
   it("gives an added model the same three modes", () => {
     const hidden = gatewayModels({ addedModels: ADDED, modelModes: { "claude-test": "hidden" } });
-    expect(ids(hidden.list())).not.toContain("claude-test");
+    expect(ids(hidden.list("language"))).not.toContain("claude-test");
     expect(hidden.resolve("claude-test")?.profile.name).toBe("Claude Test");
 
     const disabled = gatewayModels({ addedModels: ADDED, modelModes: { "claude-test": "disabled" } });
@@ -311,7 +354,7 @@ describe("GatewayModels", () => {
     expect(models.get("@cf/test/added")).toBeUndefined();
     expect(models.resolve("@cf/test/added")).toBeUndefined();
     expect(ids(models.all)).not.toContain("@cf/test/added");
-    expect(ids(models.list())).toContain("claude-test");
+    expect(ids(models.list("language"))).toContain("claude-test");
   });
 
   it("lets the catalog win an ID that an added model also claims", () => {
@@ -354,6 +397,36 @@ describe("GatewayModels", () => {
   describe("settings", () => {
     const OPUS = { provider: "anthropic", model: "claude-opus-5-5", apiToken: "" };
     const FABLE = { provider: "anthropic", model: "claude-fable-5-1", apiToken: "" };
+
+    it("gives the Auto Router model the enabled providers to pick from, or the models listed",
+        () => {
+      const models = gatewayModels({}, "anthropic,cloudflare-auto-router,ollama");
+      expect(ids(models.all)).toContain("cloudflare/auto");
+      // Its provider takes no added model, and ollama has no gateway route.
+      expect(models.addableProviders).toEqual(["anthropic"]);
+      expect(models.resolve("cloudflare/auto")?.config).toStrictEqual({
+        provider: "cloudflare-auto-router", model: "cloudflare/auto", apiToken: "",
+        autoRouterPool: { providers: ["anthropic"] },
+      });
+      expect(models.resolve("claude-opus-5-5")?.config).toStrictEqual(OPUS);
+
+      // The list is kept as stored, but the pool keeps only the enabled providers' models: openai
+      // was turned off since the list named it, and Workers AI models carry their own prefix.
+      const settings = { allowedModels: ["anthropic/*", "openai/gpt-6-luna", "@cf/*/*"] };
+      const listed = gatewayModels({ modelSettings: { "cloudflare/auto": settings } },
+          "anthropic,cloudflare,cloudflare-auto-router");
+      expect(listed.get("cloudflare/auto")?.settings).toStrictEqual(settings);
+      expect(listed.resolve("cloudflare/auto")?.config.autoRouterPool)
+          .toStrictEqual({ models: ["anthropic/*", "@cf/*/*"] });
+      // With every listed provider off the pool is empty, which getModel() refuses to send.
+      const openaiOnly = { allowedModels: ["openai/gpt-6-luna"] };
+      expect(gatewayModels({ modelSettings: { "cloudflare/auto": openaiOnly } },
+          "anthropic,cloudflare-auto-router").resolve("cloudflare/auto")?.config.autoRouterPool)
+          .toStrictEqual({ models: [] });
+      // The router routes to no Google model, so with Google alone on Auto is not offered.
+      expect(gatewayModels({}, "google,cloudflare-auto-router").get("cloudflare/auto"))
+          .toBeUndefined();
+    });
 
     it("gives a model the reasoning level set for it, and no other model", () => {
       const models = gatewayModels({ modelSettings: { "claude-opus-5-5": { reasoning: "low" } } });
@@ -578,7 +651,7 @@ describe("GatewayModels", () => {
   });
 
   describe("providers", () => {
-    const CATALOG_ORDER = ["cloudflare", "anthropic", "openai", "google"];
+    const CATALOG_ORDER = ["cloudflare-auto-router", "cloudflare", "anthropic", "openai", "google"];
     const GEMINI = "gemini-3.6-flash";
     const NO_TOKEN = 'Provider "google" cannot use the Workers AI binding transport, and no ' +
         "CF_AI_GATEWAY_API_TOKEN is configured for the HTTPS one.";
@@ -623,6 +696,7 @@ describe("GatewayModels", () => {
     it("says who enabled each provider the gateway serves, in catalog order", () => {
       expect(gatewayModels({ addedProviders: ["google"] }, "anthropic,ollama").providerSettings)
           .toStrictEqual([
+            { provider: "cloudflare-auto-router", needsApiToken: false },
             { provider: "cloudflare", needsApiToken: false },
             { provider: "anthropic", enabledBy: "environment", needsApiToken: false },
             { provider: "openai", needsApiToken: false },
@@ -631,7 +705,7 @@ describe("GatewayModels", () => {
       // The environment's listing comes first, so a provider it lists can't be turned off.
       expect(gatewayModels({ addedProviders: ["anthropic", "cloudflare"] }, "anthropic")
           .providerSettings.map(({ enabledBy }) => enabledBy))
-          .toEqual(["admin", "environment", undefined, undefined]);
+          .toEqual([undefined, "admin", "environment", undefined, undefined]);
     });
 
     it("reports a provider whose requests need a token the deployment lacks", () => {
@@ -654,10 +728,10 @@ describe("GatewayModels", () => {
 
       const models = new GatewayModels(
           new AiGatewayConfig(tokenless()), { ...NO_CONFIG, addedProviders: ["google"] });
-      expect(models.providerSettings.at(-1)).toStrictEqual(
+      expect(models.providerSettings.find(({ provider }) => provider === "google")).toStrictEqual(
           { provider: "google", enabledBy: "admin", needsApiToken: true });
-      expect(ids(models.list())).toContain(GEMINI);
-      expect(ids(models.list())).toContain("claude-opus-5-5");
+      expect(ids(models.list("language"))).toContain(GEMINI);
+      expect(ids(models.list("language"))).toContain("claude-opus-5-5");
 
       const read = await getGatewayModels({
         ...tokenless(),
@@ -691,7 +765,8 @@ describe("GatewayModels", () => {
   });
 
   // The table keeps its own list of the providers getModel can route through the gateway, so an
-  // added model it offers is one that can run. This holds the two in step.
+  // added model it offers is one that can run. This holds the two in step. The Auto Router's
+  // provider is routable but takes no added model: the router is its one model.
   it.each(Object.keys(SUGGESTED_MODELS) as AiModelProvider[])(
       "offers an added model on %s only if the gateway can route it", (provider) => {
     const unroutable = (() => {
@@ -702,18 +777,21 @@ describe("GatewayModels", () => {
         return String(err).includes("is not supported through AI Gateway");
       }
     })();
+    const addable = !unroutable && provider !== "cloudflare-auto-router";
 
     const models = gatewayModels({
       addedModels: [{ provider, id: "test-model", name: "Test", contextWindow: 1000 }],
     }, provider);
-    expect(models.get("test-model")?.provider).toBe(unroutable ? undefined : provider);
-    expect(models.resolve("test-model")?.config.provider).toBe(unroutable ? undefined : provider);
+    expect(models.get("test-model")?.provider).toBe(addable ? provider : undefined);
+    expect(models.resolve("test-model")?.config.provider).toBe(addable ? provider : undefined);
 
-    expect(models.addableProviders).toEqual(unroutable ? [] : [provider]);
+    expect(models.addableProviders).toEqual(addable ? [provider] : []);
     const add = () => gatewayModels({}, provider).assertAddable(
         { provider, id: "test-model", name: "Test", contextWindow: 1000 });
     if (unroutable) {
       expect(add).toThrow(`Provider "${provider}" is not served through AI Gateway.`);
+    } else if (!addable) {
+      expect(add).toThrow(`Models can't be added under provider "${provider}".`);
     } else {
       expect(add).not.toThrow();
     }
@@ -736,7 +814,7 @@ describe("getGatewayModels", () => {
     expect(BLUEPRINTS.get).toHaveBeenCalledWith(".adminConfig");
     expect(models!.gateway.gateway).toBe("platform-gateway");
     expect(models!.resolve("claude-fable-5-1")).toBeUndefined();
-    expect(ids(models!.list())).toContain("claude-test");
+    expect(ids(models!.list("language"))).toContain("claude-test");
     expect(models!.userModels).toBe(true);
   });
 

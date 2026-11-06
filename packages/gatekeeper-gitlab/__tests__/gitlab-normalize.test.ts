@@ -3,6 +3,7 @@
 // diff-position targets, label shapes, the shas a merge request summary may not know, and the
 // listing filters as GitLab applies them.
 
+import { parseUnifiedPatch } from "@gadgets/gatekeeper-kit/git-diff";
 import { describe, expect, it } from "vitest";
 import * as fx from "./fixtures/gitlab-docs";
 import {
@@ -20,7 +21,6 @@ import {
   normalizeMergeRequestSummary,
   normalizeTagSummary,
   parseChangesCount,
-  parsePatch,
   parseResourceUrl,
   projectRef,
   revisionFromDiffRefs,
@@ -120,27 +120,6 @@ describe("normalizeDiffFile", () => {
     expect(normalizeDiffFile({ ...readme, collapsed: true })).toMatchObject({ diffOmitted: true });
     expect(normalizeDiffFile(readme)).not.toHaveProperty("diffOmitted");
   });
-
-  it("numbers lines on both sides through parsePatch", () => {
-    const hunks = parsePatch(fx.compareResponse.data.diffs[0].diff);
-    expect(hunks).toHaveLength(1);
-    expect(hunks[0].header).toBe("@@ -24,8 +24,10 @@");
-    const removed = hunks[0].lines.filter(l => l.kind === "removed");
-    expect(removed.map(l => l.oldLineNumber)).toEqual([27, 28]);
-    const added = hunks[0].lines.filter(l => l.kind === "added");
-    expect(added.map(l => l.newLineNumber)).toEqual([30, 31, 32, 33]);
-  });
-
-  it("reads no line past a patch's final newline", () => {
-    // Every line of a patch ends in one, so the empty string after the last is no line: read as
-    // one, it would be a blank context line past the end of the hunk, there to comment on.
-    const [hunk] = parsePatch("@@ -1,2 +1,2 @@\n a\n-b\n+c\n");
-    expect(hunk.lines).toEqual([
-      { kind: "context", text: "a", oldLineNumber: 1, newLineNumber: 1 },
-      { kind: "removed", text: "b", oldLineNumber: 2 },
-      { kind: "added", text: "c", newLineNumber: 2 },
-    ]);
-  });
 });
 
 describe("commentTargetFromPosition", () => {
@@ -204,6 +183,25 @@ describe("labels, tags, merge request summary", () => {
 
   it("carries an issue's upvotes, the key a popularity listing is ordered by", () => {
     expect(normalizeIssueSummary(INSTANCE, "group/project", fx.issueResponse.data).upvotes).toBe(4);
+  });
+
+  it("uses the returned project path for moved issue and merge request references, including fork targets", () => {
+    const moved = "acme/renamed";
+    const issue = normalizeIssueSummary(INSTANCE, "group/project", {
+      ...fx.issueResponse.data, web_url: `${INSTANCE}/${moved}/-/issues/1`,
+    });
+    expect(issue.project).toEqual(projectRef(INSTANCE, moved));
+    expect(issue.url).toBe(`${INSTANCE}/${moved}/-/issues/${issue.id}`);
+    const mr = { ...fx.mergeRequestResponse.data, web_url: `${INSTANCE}/${moved}/-/merge_requests/1` };
+    const sameProject = normalizeMergeRequestSummary(INSTANCE, "group/project", mr);
+    expect(sameProject.project).toEqual(projectRef(INSTANCE, moved));
+    expect(sameProject.source.project).toEqual(sameProject.project);
+    expect(sameProject.target.project).toEqual(sameProject.project);
+    expect(sameProject.url).toBe(`${INSTANCE}/${moved}/-/merge_requests/${sameProject.id}`);
+    const fork = projectRef(INSTANCE, "fork/project");
+    const fromFork = normalizeMergeRequestSummary(INSTANCE, "group/project", mr, fork);
+    expect(fromFork.target.project).toEqual(projectRef(INSTANCE, moved));
+    expect(fromFork.source.project).toEqual(fork);
   });
 });
 
@@ -296,7 +294,7 @@ describe("diffAnchor", () => {
 describe("diffLinePositions", () => {
   it("re-walks the hunk with both counters, like GitLab's own line_code, and names the line's kind", async () => {
     const { diffLinePositions } = await import("../src/gitlab-normalize");
-    const hunks = parsePatch(fx.compareResponse.data.diffs[0].diff);
+    const hunks = parseUnifiedPatch(fx.compareResponse.data.diffs[0].diff);
     // Hunk @@ -24,8 +24,10 @@: three context lines, two removed (old 27, 28), three context, four added.
     expect(diffLinePositions(hunks, "new", 24)).toEqual({ oldLine: 24, newLine: 24, kind: "context" });
     // The first removed line sits at old 27; the new counter has not advanced past 27 yet.

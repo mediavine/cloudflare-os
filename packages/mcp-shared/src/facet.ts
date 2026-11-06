@@ -83,11 +83,19 @@ export abstract class McpFacetBase<
   /** Human-readable resource named when refusing an observer. */
   protected abstract get observerName(): string;
 
+  /** Who may open a workspace reading through this facet, as a refusal names them. */
+  protected get observerOpeners(): string {
+    return "its owner";
+  }
+
   /** Connector-owned account capability used for endpoint calls. */
   protected abstract account(): ConnectionAccount;
 
   /** Human-readable server label used in observations and action prompts. */
   abstract get serverName(): string;
+
+  /** See `McpSessionHost.observationSubresources`. */
+  abstract get observationSubresources(): readonly string[] | undefined;
 
   /** Describes the connector-specific resource represented by this facet. */
   abstract describe(): Promise<ResourceDescription>;

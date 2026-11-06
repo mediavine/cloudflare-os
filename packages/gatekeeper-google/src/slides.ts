@@ -9,25 +9,30 @@ import { AccessTokenCache, type AccessTokenRequest } from "./auth-retry";
 import {
   boundProps, createFileOnce, isSimulated, UNCREATED_FILE_ID, type SimulatedFileProps,
 } from "./creation";
+import { DriveApi } from "./drive-api";
 import { unguardedNativeRead, type NativeRead } from "./drive-session";
-import type { GoogleVerifierApi } from "./google-verifier-types";
+import { requireFileSubresources } from "./file-subresources";
+import { verifyGoogleSubresourceAccess, type GoogleVerifierApi } from "./google-verifier-types";
 import { Mutex } from "./mutex";
+import { explainUnopenedFile } from "./office-conversion";
 import { ReadGate } from "./read-gate";
 import { nativeFileUrl } from "./resources";
 import { batchKind, SLIDES_ACTIONS } from "./slides-actions";
 import {
   BlankPresentation, GoogleSlidesApi, type PresentationReader, type ThumbnailSize,
 } from "./slides-api";
-import { layoutNames, mastersOf, presentationInfo, slideIds, slideOf, titleOf } from "./slides-model";
+import {
+  layoutNames, mastersOf, presentationInfo, slideIds, slideOf, themePagesOf, titleOf,
+} from "./slides-model";
 import type {
   PresentationInfo, Slide, SlideThumbnail, SlideThumbnailSize,
 } from "./slides-read-types";
-import { designDeck, type DesignStep } from "./slides-design";
+import { designDeck, pageOf, slideIdOf, type DesignChange, type DesignStep } from "./slides-design";
 import { prepareChanges } from "./slides-design-input";
 import {
   batchSlides, conflictReason, instantiatedPlaceholders, mintObjectId, movedOrder, newSlidePlace,
   replayChanges, slidesToFetch, type Deck, type QueuedChange, type SlideLabel, type SlidesAction,
-  type SlidesActions,
+  type SlidesActions, type ThemeLabel,
 } from "./slides-simulation";
 import { elementIdsOf } from "./slides-target";
 import { ChangeConflict } from "./slides-text";
@@ -96,6 +101,7 @@ export class GoogleSlidesGatekeeperImpl
   });
 
   #api = new GoogleSlidesApi((opts?: AccessTokenRequest) => this.#tokens.get(opts));
+  #drive = new DriveApi((opts?: AccessTokenRequest) => this.#tokens.get(opts));
   #presentationId = isSimulated(this.ctx.props) ? UNCREATED_FILE_ID : this.ctx.props.presentationId;
   #journal = new ActionJournal<SlidesAction>(this.ctx.storage.kv, { namespace: "slides" });
   #actions = SLIDES_ACTIONS.bind(this.#journal, { api: this.#api, presentationId: this.#presentationId });
@@ -120,8 +126,11 @@ export class GoogleSlidesGatekeeperImpl
         tsType: "GooglePresentationSession",
       };
     }
-    let title = await this.#api.getPresentationTitle(props.presentationId) ??
-      "Untitled presentation";
+    let title = await this.#api.getPresentationTitle(props.presentationId)
+      .catch(async (error: unknown) => {
+        throw await explainUnopenedFile(
+          "slides", error, async () => (await this.#drive.getFile(props.presentationId)).mimeType);
+      }) ?? "Untitled presentation";
     return {
       url: nativeFileUrl("slides", props.presentationId),
       title,
@@ -143,11 +152,13 @@ export class GoogleSlidesGatekeeperImpl
     let props = this.ctx.props;
     let queue = approvalQueue.dup();
     // A presentation binding's scope is the one presentation, so there is nothing to revalidate.
+    // Every read reports it, except one not created yet, which holds only what the caller wrote.
     return new GooglePresentationSessionImpl(
       isSimulated(props) ? new BlankPresentation(props.creation.title) : this.#api,
       this.#presentationId,
       queue,
-      unguardedNativeRead(description => queue.authorizeObservation(description)),
+      unguardedNativeRead(description => queue.authorizeObservation(description),
+        isSimulated(props) ? [] : [{ kind: "presentation", fileId: props.presentationId }]),
       {
         snapshot: read => this.#reads.read(() => read(this.#journal.listUndecided())),
         queue: (kind, prepare) => this.#prepareExclusively(async () => {
@@ -218,6 +229,10 @@ export class GoogleSlidesGatekeeperImpl
    * Observer tracking — strategy B (ACL check, single unit). Google applies sharing permissions at
    * presentation granularity, so an observer must be able to open this presentation with their
    * own account. The overseer re-runs this check on every open, catching revoked access.
+   *
+   * Reads now also report the presentation as a `slides/presentation/<presentationId>`
+   * subresource, which verifyObserverAccess checks; this check stays for the reads made before
+   * they did.
    */
   async addObserver(_id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
     let verifier = user as unknown as Fetcher<GoogleVerifierApi>;
@@ -230,6 +245,19 @@ export class GoogleSlidesGatekeeperImpl
   }
 
   async removeObserver(_id: string): Promise<void> {}
+
+  /**
+   * Checks the presentation subresource every read reports, failing the whole call for any other
+   * ID. Each observer's UserAccount answers whether the Slides API opens the presentation for their
+   * own account, reusing recent answers (see UserAccount.checkSubresourceAccess).
+   */
+  async verifyObserverAccess(
+    observers: { id: string; verifier: Fetcher<GatekeeperUserVerifier> }[],
+    subresources: string[],
+  ): Promise<{ allowedObserverIds: string[] }> {
+    requireFileSubresources(subresources, ["presentation"]);
+    return verifyGoogleSubresourceAccess(observers, subresources);
+  }
 }
 
 /** A read with queued changes applied, and the first that no longer applies. */
@@ -252,6 +280,15 @@ function labelOf(deck: Deck, id: string): SlideLabel {
   let slide = deck.slides.get(id);
   let title = slide && titleOf(slide);
   return { number: deck.order.indexOf(id) + 1, ...(title ? { title } : {}) };
+}
+
+/** One master's or layout's name, and a layout's master's, for the approver. */
+function themeLabelOf(deck: Deck, id: string): ThemeLabel {
+  let page = deck.themePages.get(id);
+  let name = page?.masterProperties?.displayName ?? page?.layoutProperties?.displayName;
+  let masterId = page?.layoutProperties?.masterObjectId;
+  let master = masterId && deck.themePages.get(masterId)?.masterProperties?.displayName;
+  return { ...(name ? { name } : {}), ...(master ? { master } : {}) };
 }
 
 @validateRpc()
@@ -282,10 +319,11 @@ export class GooglePresentationSessionImpl extends RpcTarget implements GooglePr
   }
 
   /**
-   * The slide order and the content of `ids`, with queued changes applied. A slide that no longer
-   * exists, or never did, is absent from `deck.order`.
+   * The slide order, every master and layout, and the content of the slides among `pages`, with
+   * queued changes applied. A slide that no longer exists, or never did, is absent from
+   * `deck.order`.
    */
-  async #simulated(ids: readonly string[]) {
+  async #simulated(pages: readonly string[]) {
     return this.#changes.snapshot(async changes => {
       let outline = await this.#api.getOutline(this.#presentationId);
       let order = slideIds(outline);
@@ -296,26 +334,30 @@ export class GooglePresentationSessionImpl extends RpcTarget implements GooglePr
         layouts: layoutNames(outline),
         ...replayed({
           order,
-          slides: await this.#api.getSlides(this.#presentationId, slidesToFetch(ids, changes), order),
+          slides: await this.#api.getSlides(this.#presentationId, slidesToFetch(pages, changes), order),
           ...mastersOf(outline),
+          themePages: themePagesOf(outline),
         }, changes),
       };
     });
   }
 
   /**
-   * Reads `ids` to prepare a change, refusing one that is absent, that a conflict blocks, or that
-   * the account may not make.
+   * Reads `ids`, and the masters and layouts `themePages` names, to prepare a change, refusing one
+   * that is absent, that a conflict blocks, or that the account may not make.
    */
-  async #prepare(ids: readonly string[], purpose: string) {
+  async #prepare(ids: readonly string[], purpose: string, themePages: readonly string[] = []) {
     return preparable(ids, await this.#read(
-      () => this.#simulated(ids),
-      ({ title }) => ({
+      () => this.#simulated([...ids, ...themePages]),
+      ({ title }) => ids.length === 0 && themePages.length > 0 ? {
+        title: "Read Google Slides masters and layouts to change them",
+        description: `Read the masters and layouts of "${title}" to ${purpose}.`,
+      } : {
         title: "Read Google Slides slides to change them",
         description: ids.length === 0
           ? `Read the slide order of "${title}" to ${purpose}.`
           : `Read ${ids.length} slide(s) in "${title}" to ${purpose}.`,
-      })));
+      }));
   }
 
   async getPresentation(): Promise<PresentationInfo> {
@@ -330,22 +372,21 @@ export class GooglePresentationSessionImpl extends RpcTarget implements GooglePr
           ...(rest.slides ?? []).map(slide => [slide.objectId!, slide] as const),
           ...await this.#api.getSlides(this.#presentationId, slidesToFetch(edited, changes), order),
         ]);
-        let { deck, conflict } = replayed({ order, slides, ...mastersOf(rest) }, changes);
+        let { deck, conflict } = replayed(
+          { order, slides, ...mastersOf(rest), themePages: themePagesOf(rest) }, changes);
         return {
-          ...presentationInfo({
-            ...rest,
-            slides: deck.order.map(id => deck.slides.get(id)!),
-            // Less any master a queued deletion leaves with no slide, as Google removes it.
-            layouts: rest.layouts?.filter(({ objectId }) => !!objectId && deck.masters.has(objectId)),
-          }),
+          // Less any master, and its layouts, a queued deletion leaves with no slide, as Google
+          // removes them.
+          ...presentationInfo(
+            { ...rest, slides: deck.order.map(id => deck.slides.get(id)!) }, deck.themePages),
           ...(conflict ? { queuedChangeConflict: conflict } : {}),
         };
       }),
       info => ({
         title: "Read Google Slides presentation outline",
         description:
-          `Read the outline of "${info.title}": its ${info.slides.length} slide(s), their ` +
-          "layouts, and their titles.",
+          `Read the outline of "${info.title}": its masters and layouts, and its ` +
+          `${info.slides.length} slide(s), their layouts, and their titles.`,
       }));
   }
 
@@ -408,12 +449,17 @@ export class GooglePresentationSessionImpl extends RpcTarget implements GooglePr
 
   async updateSlides(changes: SlideChange[]): Promise<Record<string, string>> {
     let { changes: prepared, refs } = prepareChanges(changes);
-    let ids = [...new Set(changes.map(change => change.slideId))];
+    let ids = [...new Set(prepared.flatMap(change => slideIdOf(change) ?? []))];
+    let themePages = [...new Set(prepared.flatMap(change => {
+      let { pageType, id } = pageOf(change);
+      return pageType === "SLIDE" ? [] : [id];
+    }))];
     return this.#changes.queue(batchKind(prepared), async () => {
-      let { deck } = await this.#prepare(ids, "queue changes to them");
+      let { deck } = await this.#prepare(ids, "queue changes to them", themePages);
       // Google names a new slide's notes shape itself, as it creates the slide, so until then an
       // edit has nothing to address. Every slide Google has, and a queued copy of one, has notes.
-      let unborn = prepared.find(change => change.op === "editText" && change.elementId === undefined &&
+      let unborn = prepared.find((change): change is Extract<DesignChange, { op: "editText" }> =>
+        change.op === "editText" && change.elementId === undefined &&
         !deck.slides.get(change.slideId)?.slideProperties?.notesPage);
       if (unborn) {
         throw new Error(`Slide "${unborn.slideId}" is awaiting approval to be added, and Google gives it ` +
@@ -445,6 +491,9 @@ export class GooglePresentationSessionImpl extends RpcTarget implements GooglePr
         payload: {
           changes: queued,
           slides: Object.fromEntries(ids.map(id => [id, labelOf(deck, id)])),
+          ...(themePages.length > 0
+            ? { themes: Object.fromEntries(themePages.map(id => [id, themeLabelOf(deck, id)])) }
+            : {}),
         },
         result: refs,
       };
