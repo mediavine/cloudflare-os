@@ -1,6 +1,5 @@
-// Pure-logic coverage for git-diff.ts: tree-object parsing, the pruning tree-to-tree walk, and
-// the line-level unified diff whose hunks must match the shape a gatekeeper's patch reader
-// produces from the provider's own patches.
+// Pure-logic coverage for git-diff.ts: tree-object parsing, the pruning tree-to-tree walk, the
+// line-level unified diff, and the unified-patch reader whose hunks the diff must match.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -10,10 +9,12 @@ import {
   diffGitTrees,
   diffTextLines,
   parseGitTreePayload,
+  parseUnifiedPatch,
   treeEntryKind,
   type GitTreeEntry,
   type TreeDiffSource,
 } from "../src/git-diff";
+import { bufferedGitObject } from "../src/git-objects";
 
 /** Deterministic fake full oid. */
 function oid(n: number): string {
@@ -279,6 +280,48 @@ describe("diffTextLines", () => {
   });
 });
 
+describe("parseUnifiedPatch", () => {
+  it("reads diffTextLines' hunks back from their patch text, numbering and EOF markers included", () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line${i + 1}`);
+    const changed = lines.with(1, "two").with(19, "twenty");
+    const { hunks } = diffTextLines(lines.join("\n"), changed.join("\n"));
+    expect(hunks).toHaveLength(2);
+    const prefix = { added: "+", removed: "-", context: " " };
+    const patch = hunks.flatMap(hunk => [
+      hunk.header,
+      // An unnumbered line is the `\ No newline at end of file` marker, written verbatim.
+      ...hunk.lines.map(line => line.oldLineNumber === undefined && line.newLineNumber === undefined
+        ? line.text : prefix[line.kind] + line.text),
+    ]).map(line => `${line}\n`).join("");
+    expect(parseUnifiedPatch(patch)).toEqual(hunks);
+  });
+
+  it("reads no line past a patch's final newline", () => {
+    // Read as a line, the empty string after the last newline would be a blank context line past
+    // the end of the hunk, there to comment on.
+    const [hunk] = parseUnifiedPatch("@@ -1,2 +1,2 @@\n a\n-b\n+c\n");
+    expect(hunk.lines).toEqual([
+      { kind: "context", text: "a", oldLineNumber: 1, newLineNumber: 1 },
+      { kind: "removed", text: "b", oldLineNumber: 2 },
+      { kind: "added", text: "c", newLineNumber: 2 },
+    ]);
+  });
+
+  it("skips a diff --git preamble and restarts numbering at each hunk header", () => {
+    const patch = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n@@ -10,2 +9,0 @@ fn()\n-c\n-d";
+    expect(parseUnifiedPatch(patch)).toEqual([
+      {
+        header: "@@ -1 +1 @@",
+        lines: [{ kind: "removed", text: "a", oldLineNumber: 1 }, { kind: "added", text: "b", newLineNumber: 1 }],
+      },
+      {
+        header: "@@ -10,2 +9,0 @@ fn()",
+        lines: [{ kind: "removed", text: "c", oldLineNumber: 10 }, { kind: "removed", text: "d", oldLineNumber: 11 }],
+      },
+    ]);
+  });
+});
+
 describe("diffGitTrees", () => {
   // Old tree: a.txt (edited), sub/x.txt (unchanged), big.bin (unchanged).
   // New tree adds sub/y.txt.
@@ -357,6 +400,27 @@ describe("diffGitTrees", () => {
       expect(file.hunks).toEqual([]);
       expect(file.additions).toBe(0);
     }
+  });
+
+  it("omits a blob the git cache streams, cancelling the stream", async () => {
+    // GitCache.get() streams an object over MAX_BUFFERED_BLOB_SIZE; an adapter over it hands the
+    // diff "unavailable" for one, after cancelling it, through bufferedGitObject().
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull: controller => controller.enqueue(new Uint8Array(1024)),
+      cancel: () => { cancelled = true; },
+    });
+    const source: TreeDiffSource = {
+      getTree: async id => id === oid(41) ? [{ mode: "100644", name: "big.bin", oid: oid(9) }] : [],
+      getBlob: async () => {
+        const cached = bufferedGitObject({ type: "blob", content: stream }, "blob");
+        return cached === null || cached === "streamed" ? "unavailable" : cached;
+      },
+    };
+    const files = await diffGitTrees(source, oid(40), oid(41));
+    expect(files.map(file => [file.path, file.diffOmitted])).toEqual([["big.bin", true]]);
+    await Promise.resolve();
+    expect(cancelled).toBe(true);
   });
 
   it("reports submodule pointer and mode-only changes without a patch", async () => {

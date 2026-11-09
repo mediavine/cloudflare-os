@@ -22,6 +22,7 @@ export {
   GoogleSlidesGatekeeperImpl, GoogleVerifier,
 };
 export default GoogleWorker;
+export { CalendarTestHooks, GoogleCalendarGatekeeperImpl } from "./calendar-hooks";
 
 export class UserAccount extends DurableObject<Env> {
   /** Names the account in its token, so a provider fake can tell which account a request was made as. */
@@ -94,6 +95,7 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 export class TestHooks extends DurableObject<Env> {
   #lastActionDescription = "";
   #lastActionFields: ActionField[] = [];
+  #lastActionVerdict: { actionKind?: ActionKind; autoApprovable?: boolean } = {};
   #lastObservations: string[] = [];
   /** The class each facet runs, where it is not the default bound Google Doc. */
   #classes = new Map<string, DurableObjectClass<Gatekeeper<any>>>();
@@ -108,6 +110,16 @@ export class TestHooks extends DurableObject<Env> {
   /** The structured fields of that approval description. */
   get lastActionFields(): ActionField[] {
     return this.#lastActionFields;
+  }
+
+  /** That edit's action kind and auto-approval verdict. */
+  get lastActionVerdict(): { actionKind?: ActionKind; autoApprovable?: boolean } {
+    return this.#lastActionVerdict;
+  }
+
+  /** The kinds the bound Google Doc reports as auto-approvable. */
+  async docAutoApprovable(facetName: string): Promise<ActionKind[]> {
+    return this.#gatekeeper(facetName).getAutoApprovableActions();
   }
 
   /** Observation descriptions authorized by the most recent session, successful or not. */
@@ -145,7 +157,7 @@ export class TestHooks extends DurableObject<Env> {
     let userObjectId = this.ctx.exports.UserAccount.idFromName(userName).toString();
     try {
       let created = await (this.#gatekeeper(facetName) as unknown as Gatekeeper<any>)
-        .applyCreation!(this.ctx.exports.GoogleVerifier({ props: { userObjectId } }));
+        .applyCreation!(this.ctx.exports.GoogleVerifier({ props: { userObjectId } }), null);
       this.#created.set(facetName, created.class);
       return { resourceUrl: created.resourceUrl };
     } catch (error) {
@@ -206,6 +218,9 @@ export class TestHooks extends DurableObject<Env> {
     } finally {
       this.#lastActionDescription = queue.actionDescription ?? "";
       this.#lastActionFields = queue.actionFields;
+      this.#lastActionVerdict = {
+        actionKind: queue.action?.actionKind, autoApprovable: queue.action?.autoApprovable,
+      };
       this.#lastObservations = queue.observations;
     }
   }

@@ -127,6 +127,33 @@ function vendorBundle(): string {
 }
 
 describe("embedded agent declarations", () => {
+  it("exposes binary uploads and removable draft attachments without message write authority", () => {
+    const types = source("types.txt");
+    expect(compileAgentTypes(types + `
+declare const draft: GmailDraft;
+declare const message: GmailMessage;
+const file: GmailAttachmentInput = {
+  filename: "report.pdf", mimeType: "application/pdf", content: new ArrayBuffer(1),
+};
+const compose: GmailComposeOptions = {attachments: [file]};
+const reply: GmailReplyOptions = {attachments: [file]};
+const initial: GmailDraftInput = {attachments: [file]};
+const added: Promise<GmailDraftAttachment> = draft.addAttachment(file);
+const entries: Promise<GmailDraftAttachmentEntry[]> = draft.attachments();
+declare const draftAttachment: GmailDraftAttachment;
+const readable: GmailAttachment = draftAttachment;
+const removed: Promise<void> = draftAttachment.remove();
+// @ts-expect-error Patches cannot replace all attachments.
+const patch: GmailDraftPatch = {attachments: [file]};
+// @ts-expect-error Message attachment capabilities remain read-only.
+readable.remove();
+// @ts-expect-error Uploads take exact binary buffers, not base64 strings.
+const encoded: GmailAttachmentInput = {filename: "file", mimeType: "text/plain", content: "YQ=="};
+// @ts-expect-error Messages cannot add attachments.
+message.addAttachment(file);
+`).filter(message => !message.includes("'cloudflare:workers'"))).toEqual([]);
+  });
+
   it("compiles the exact Google Doc agent declaration bundle without module dependencies", () => {
     expect(compileAgentTypes(docBundle())).toEqual([]);
   });
@@ -272,5 +299,27 @@ const legacy: SheetCellFormat = { wrap: "OVERFLOW_CELL" };
     expect(driveTypes).not.toContain("GoogleSpreadsheetSession>");
     expect(driveTypes).not.toContain("GooglePresentationSession>");
     expect(driveTypes).toContain("export interface GoogleDriveReadSession");
+  });
+
+  it("streams PDF text from both Drive sessions", () => {
+    const driveTypes = source("drive-types.d.ts");
+    expect(driveTypes).toContain("export type DrivePdfText = {");
+    expect(driveTypes.split("readPdf(fileId: string): Promise<DrivePdfText>;")).toHaveLength(3);
+    expect(compileAgentTypes(driveBundle() + `
+declare const drive: GoogleDriveReadSession;
+declare const folder: GoogleDriveFolderSession;
+async function read(): Promise<string> {
+  const { text, hasText } = await drive.readPdf("file-1");
+  const flag: boolean = hasText;
+  const reader = (await folder.readPdf("file-2")).text.getReader();
+  const first: Uint8Array | undefined = (await reader.read()).value;
+  await reader.cancel();
+  return new Response(text).text();
+}
+// @ts-expect-error The text is a stream, not a string.
+const whole: DrivePdfText = { text: "", hasText: true };
+// @ts-expect-error Nothing is cut, so there is no truncation flag.
+const cut: DrivePdfText = { text: new ReadableStream(), hasText: true, truncated: false };
+`)).toEqual([]);
   });
 });

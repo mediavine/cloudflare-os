@@ -21,6 +21,12 @@ Keys:
 - `accessToken`, `scopes` -> the layout from before expiring grants were supported, migrated into `credentials` on first read and then deleted.
 - `expiredNotified`, `expiredNotifiedArm` -> the kit's expiry latch, so `credentialsExpired()` is only sent once per dead grant. Every credential replacement re-arms it.
 - `reconnecting` -> boolean flag indicating an in-progress reconnect flow.
+- `cache:@access:*` -> the kit's `KvTtlCache` of this account's own answers about repository
+  access, keyed by `repo/<repoId>` subresource and partitioned by the connection generation, which
+  every connect and reconnect replaces: `GET /repositories/<id>` asked with this account's token
+  when it observes another's binding. A grant is reused for 15 minutes and a denial for 15
+  seconds, and only while the grant is live: the partition is read through it on every use, so a
+  disconnected or confirmed-dead grant fails the check instead. A failure to answer is never stored.
 
 No per-user SQL tables are used.
 
@@ -38,9 +44,20 @@ No per-user SQL tables are used.
 ### Repository identity
 
 - `repoId` -> the bound repository's GitHub id, read once from `/repos/<owner>/<repo>`, whose
-  redirect to `/repositories/<id>` (a renamed or transferred repo) is the only one followed
-  before the id is known. With it, redirects are followed only to the same path under
-  `/repositories/<repoId>`; every other redirect fails the request. Absent until first use.
+  redirect to `/repositories/<id>` (a renamed or transferred repo) is the only one followed. Every
+  REST request beneath the repository is then sent beneath `/repositories/<repoId>` and follows no
+  redirect, issue search and git fetches and pushes go to the name that id has now (see
+  `cache:repo-name`), and every read reports `repo/<repoId>` as its subresource. Absent until
+  first use, and nothing is read or written until it is stored. `addObserver` reads it as stored
+  and never stores it: without it, the binding has read nothing by id, and admission checks the
+  name alone. A binding that read before ids were pinned was pinned to whichever repository its
+  name named at its first read since.
+- `cachesByRepoId` -> `true` once the caches hold only what was read by the pinned id. A binding
+  without it may hold reads a release that addressed the repository by name made, from whichever
+  repository had the name then, so on start the `cache:*` families are invalidated by moving
+  `cacheGeneration`, the `discussionComments:*` and `pullReviewComments:*` streams are deleted,
+  and this is set. `ciLog:*` stays, since each log is revalidated by job id beneath the pinned
+  repository before use.
 
 ### Action log
 
@@ -64,7 +81,9 @@ Stored action variants:
 - `replyToDiffComment`
 - `mergePullRequest` (bound to `expectedHeadSha` at queue time; a record from before that
   binding applies at the agent's `options.expectedHeadSha`, and is refused without one)
-- `push`
+- `push` (`gatedBranch` records whether the branch was the default or a protected branch at
+  queue time; a record without it counts as gated. The submit-time verdict reads it, and apply
+  checks a push it left ungated again)
 
 Pending records are the source of truth for simulation.
 
@@ -80,6 +99,25 @@ Before approval, `realId` is absent. After the create action is applied, `realId
 
 Written when a diff reply is applied. Unread while replies to provisional comments are refused
 (see Design choices).
+
+### CI push records
+
+- `ciPushApplied:<sha>` -> epoch ms when this gatekeeper applied a push leaving a branch at `sha`.
+  The CI absence policy's first source for when a commit became a head: `getChecks()` reads a
+  commit nothing has reported on as `notStarted` for 10 minutes from then while CI is expected.
+  Written at push apply (a retried apply keeps the first record); each write deletes records
+  older than 10 minutes and caps the family at 100, dropping the oldest.
+
+### CI job logs
+
+- `ciLog:*` -> finished GitHub Actions job logs, keyed by job id, as the kit's `CiLogCache` stores
+  them: a metadata record, newline-joined line chunks of at most 512 KiB each, an age index, and
+  a total-size counter. One hour TTL, 32 MiB in all (oldest evicted first). Every `readLog()`
+  first asks GitHub's logs endpoint again: a 404 or 410 deletes the entry and reports the log
+  deleted. Unfinished jobs' logs are never stored. Not invalidated by `cacheGeneration`: a
+  finished log only changes by being deleted, which the revalidation catches.
+
+CI status (check runs, commit statuses, workflow runs, jobs) is never cached: it moves on its own.
 
 ### Incremental discussion sync state
 
@@ -139,11 +177,19 @@ Implemented TTL cache families:
 - `cache:repo-v2:<owner>:<repo>` -> `GitHubRepoMetadata` (v2: the shape gained `defaultBranch`,
   and etag revalidation can keep an old-shaped entry alive past the TTL)
 - `cache:issue:<realId>` -> `GitHubIssueDetails`
-- `cache:pull:<realId>` -> `GitHubPullRequestDetails`
+- `cache:pull-v2:<realId>` -> `GitHubPullRequestDetails` (v2: the shape gained `mergeState`, and
+  etag revalidation can keep an old-shaped entry alive past the TTL)
 - `cache:list-issues-v2:<encodedQuery>:p<page>` -> `(GitHubIssueSummary | null)[]`, one entry per
   upstream row (`null` for pull requests), so a page keeps the length that ends the walk (v2: v1
   stored filtered, short pages)
-- `cache:search-issues-scoped-v1:<encodedQuery>` -> validated source URLs and `GitHubIssueSummary` values
+- `cache:search-issues-scoped-v1:<owner>:<repo>:<encodedQuery>:p<page>` -> validated source URLs and
+  `GitHubIssueSummary` values, under the owner and name the repository had, read by its id, when
+  searched (GitHub's search takes only a name)
+- `cache:repo-name:<repoId>` -> the repository's owner and name now, revalidated with its ETag on
+  every use: before each issue search and each git fetch or push, and again once GitHub answers a
+  search or fetch, unless the search's answer is a 304 or a cached page, which the name it was
+  cached under already scopes; a push, which GitHub has applied once it answers, is not checked
+  again
 - `cache:list-pulls-v2:<encodedQuery>:p<page>` -> `GitHubPullRequestSummary[]`, unfiltered (v2: v1
   dropped rows with pending actions)
 - `cache:search-pulls-v2:<state>:p<page>` -> `GitHubPullRequestSummary & { bodyMarkdown }` rows of
@@ -155,12 +201,14 @@ Implemented TTL cache families:
 - `cache:compare-provisional-v2:<provisionalPullId>` -> provisional diff snapshot from branch
   comparison (v2: same `mergeBaseSha` addition)
 - `cache:merge-base:<baseSha>:<headSha>` -> merge base commit id of the two commits
+- `cache:required-checks:<encodedBranch>` -> names of the status checks a base branch requires
+  (its rulesets' `required_status_checks` rules plus classic protection), for `missingRequired`
 
 ### Cache TTLs
 
 - Viewer cache: 5 minutes
-- Entity caches (`repo-v2`, `issue`, `pull`, `discussion-reviews`, `resolve-ref`, `diff-v2`):
-  30 seconds
+- Entity caches (`repo-v2`, `issue`, `pull-v2`, `discussion-reviews`, `resolve-ref`, `diff-v2`,
+  `required-checks`): 30 seconds
 - List/search caches: 15 seconds
 - `merge-base` entries never expire (a merge base is a pure function of its two key commits);
   only the generation bump below evicts them
@@ -179,6 +227,43 @@ Cache invalidation strategy:
   subsequent reads revalidate it with `since` before use.
 - Simulation is then rebuilt from the pending action log on subsequent reads.
 
+## GitHubHookDriver Durable Object
+
+One per connected account, named by its `UserAccount` id; see `src/github-hooks.ts`.
+
+- `account` -> the `UserAccount` id, whose token adds and deletes the webhooks; kept, once the
+  account is disconnected, until the last of them is gone.
+- `viewer` -> the GitHub user id the account last read as, whose own comments and reviews no hook
+  is handed: read when a hook is enabled, when the account reconnects, and at each hourly check.
+- `secret` -> the HMAC key every webhook of this driver signs its deliveries with.
+- `webhook:<repoId>` -> `{ id, repo: { owner, repo, id } }`, the webhook this driver added to the
+  repository, from when its first hook is enabled until GitHub has deleted it, once its last is
+  disabled or the account disconnected, or can't: the hourly check, and another disconnect, try
+  again meanwhile. Reached by the repository's id, which survives a rename.
+- `unrecorded:<repoId>:<url>` -> `{ repo, url }`, written as GitHub is asked to add or change the
+  repository's webhook at `url` and deleted once its id is recorded: should GitHub's answer be
+  lost, the webhook at `url` is found by it and deleted, as the account is disconnected or, while
+  no hook needs it there, at the hourly check.
+- `repaired:<repoId>` -> when that webhook's configuration was last restored, by the hourly check
+  or by enabling or disabling a hook there: what GitHub failed to deliver before then is
+  redelivered whatever the refusal, which may have been the misconfiguration's. Deleted with the
+  webhook.
+- `checkAt` -> when to next check the webhooks on GitHub, hourly while there are any.
+- `redeliverFrom` -> the repository id the next check's share of redeliveries starts with: the one
+  after the last the previous check served.
+- `reg:<hookKey>` -> what one enabled hook watches: its repository, the issue or pull request it
+  is narrowed to, and its event kinds.
+- `caps:<hookKey>` -> `{ delivery, initiator }`: the facet's persistent delivery stub and the
+  Workshop's `HookInitiator`.
+- `msg:<hookKey>:<eventId>` -> the kit's `HookDeliveryQueue` rows, named by the digest of the
+  event's payload: an event pending delivery to one hook, or a finished one kept for a day to
+  collapse redeliveries.
+- `queue:due:<time>:<hookKey>:<eventId>`, `queue:finished:<time>:<hookKey>:<eventId>` and
+  `queue:indexed` -> the queue's indexes of those rows: by when each pending one is next due, and
+  when each finished one finished, which the dedupe window counts from.
+- `revoked` -> set, with every key but `account`, `webhook:` and `unrecorded:` deleted, once the
+  account is disconnected.
+
 ## Simulation model
 
 - Reads fetch cached or remote GitHub state.
@@ -187,6 +272,9 @@ Cache invalidation strategy:
 - Rejecting a provisional create retires its dependent pending actions as rejected and returns
   `restart: true`.
 - Review-thread simulation supports pending review comments and pending replies to real GitHub diff comments.
+- CI reads follow the simulated head: a commit only a queued push will deliver reads as
+  `{ state: "none", phase: "notStarted", checks: [] }` without asking GitHub, and a pull request
+  whose head is such a commit lists no workflow runs.
 
 ## Absent schema
 

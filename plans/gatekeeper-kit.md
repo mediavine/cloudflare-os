@@ -199,7 +199,8 @@ export const NONCE_KEY = "nonce";               // unchanged from every current 
 export type ConnectStage = "initiation" | "oauth";
 export type StoredNonce<Extra extends object = Record<never, never>> =
   TimedNonce & { stage: ConnectStage } & Extra;
-export function putInitiation(kv, initiationNonce: string, now: number): void;
+export function putInitiation<Meta extends object>(
+  kv, initiationNonce: string, now: number, meta?: Meta & NonceExtra): void;
 export function advanceToOAuth<Extra extends object>(
   kv, initiationNonce: string, now: number, extra?: Extra & NonceExtra): string | null;
 export function claimOAuth<Extra extends object>(
@@ -212,10 +213,16 @@ nonce in one synchronous step, so exactly one concurrent caller can advance a gi
 `Extra` fields (PKCE verifier, requested scopes). The stored shape matches the `StoredNonce` every
 existing OAuth gatekeeper writes (`mcp-shared` is the exception: `account.ts:118` also carries a
 `"connecting"` stage, which step 12 leaves in place). `Extra` stays flat rather than nested under a
-property; the reserved keys (`value`, `expiresAt`, `stage`) are intersected onto
-`advanceToOAuth`'s `extra` parameter, which both excludes them statically and rejects them at
-runtime. The exclusion lives on the parameter rather than the `Extra` constraint: as a constraint
+property; the reserved keys (`value`, `expiresAt`, `stage`) are intersected onto `putInitiation`'s
+`meta` and `advanceToOAuth`'s `extra` parameters, which both exclude them statically and reject them
+at runtime. The exclusion lives on the parameter rather than the `Extra` constraint: as a constraint
 it is a weak type, which defeats inference and collapses `StoredNonce<Extra>` to `never`.
+
+Initiation metadata records what a link was minted for, so a callback need not infer it: deriving
+"reconnect" from `stored() !== undefined` at callback time (GitLab's and X's original check)
+misroutes a reconnect whose account was disconnected meanwhile. `advanceToOAuth` carries it into
+the OAuth record, `extra` winning a name clash. Recording `firstConnect: true` at the connect entry
+point makes the absent value, a pre-deploy link included, take the safe staged path.
 
 ```ts
 export function isConnectAttempted(kv): boolean;
@@ -765,8 +772,11 @@ export function escapeObservationValue(value: string): string;
 export type ObservationScope =
   | { kind: "baseline" }                        // admission already covers this disclosure
   | { kind: "collections"; ids: readonly string[] }    // per-set verification; an empty array is refused
-  | { kind: "withholdFromObservers" };          // withhold from every admitted observer
-export type ObservationInput = Omit<ObservationDescription, "excludeObservers">;
+  | { kind: "withholdFromObservers" }           // withhold from every admitted observer
+  | { kind: "subresources"; ids: readonly string[] };  // the Workshop checks these; `[]` is accepted
+export type ObservationInput = Omit<ObservationDescription, "excludeObservers" | "subresources">;
+export function observerAccessVerifier<V>(opts: Pick<ObserverTrackerOptions<V>,
+  "hasCollectionAccess" | "concurrency">): VerifyObserverAccess;   // Gatekeeper.verifyObserverAccess
 export class ObservationGate {
   constructor(queue: RpcStub<ApprovalQueue>, strategy: ObserverStrategy);
   authorize(input: ObservationInput, scope: ObservationScope): Promise<void>;
@@ -801,6 +811,20 @@ observer sees everything read here — a truthful owner-only read under them mea
 belongs on C, and a read the premise covers should say `baseline`. Because the gate is the only
 source of that field, there is no set-union merge left to do. Sessions call the gate for every read
 instead of the raw queue.
+
+**`subresources` bypasses the strategy.** When an observation reports `subresources`, the Workshop
+attributes the read to its chat or gadget, checks that context's audience through
+`verifyObserverAccess()`, and rechecks the recorded ids at admission (`docs/observers.md` §10). A
+gatekeeper that also ran `prepare` for such a read would keep growing the binding-wide history
+whose admission refusals the per-context check exists to replace, so the arm calls no strategy
+method, and the gate owns `subresources` as it owns `excludeObservers`. The kernel decides per
+observation, so this is a scope rather than a strategy or gate mode: a binding converts read by
+read, and the strategy keeps `addObserver()` enforcing its baseline, the history recorded before
+conversion and every read not yet converted. `observerAccessVerifier` reuses the tracker's oracle
+shape but not its error policy: the tracker excludes an observer whose stored verifier throws, so
+one dead stub cannot fail every read, while the Workshop asks with fresh verifiers and expects a
+throw when access cannot be determined, so the throw propagates. It stores nothing, since the same
+observer id may arrive with another account's verifier.
 
 **A proven refusal reclaims only this read's reservations.** For withheld reads, `discard()` deletes
 the read's `observer-withhold:` marker. For set-scoped reads it releases the check's per-storage
@@ -1070,8 +1094,21 @@ these actions — the kit does, so it is the only one that both strands dependen
 The one terminal failure that does **not** cascade is an orphaned claim: its stored answer says the
 effect is unknown, so "was not applied" cannot be asserted over its dependents — the argument that
 keeps `claimed` out of `listUndecided` below, which converting the claim makes no more decidable.
-They stay pending, fail at the provider if the effect never landed, and clear by rejection —
-exactly a corpus dependent whose creator never resolved.
+They stay pending while it is, failing their applies on the unresolved reference. Rejecting the
+claim withdraws it, and nothing can bind its reference after that, so the rejection strands the
+dependents whose references it never bound, as rejecting a pending action does.
+
+**A dependent is refused at submit once nothing can provide its reference.** The cascade scans
+submitted records, so a dependent submitted *after* its provider was rejected escaped it, and every
+apply then failed retryably on the unresolved reference — an auto-approvable one stopping the
+Workshop's in-order drain for every later action on the binding. By hand, Jira and cf-wiki only
+withhold auto-approval from a dependent whose reference will not resolve, and X's sessions refuse a
+temporary id whose pending action is gone. `submit` now asks, inside the submission lane so it
+cannot race the provider's own staging, whether each `dependsOn` reference is resolved
+(`isResolvedReference`) or provided by a pending or claimed record, and refuses the action before
+allocating otherwise. A provider decided in the one round trip while the dependent is being
+delivered escapes the cascade, which cannot see a staged record, so `submit` asks again once the
+dependent is submitted and fails it the way the cascade would have.
 
 `provides` and `dependsOn` return arrays, not `Iterable<string>`. Every one of those six cascades
 keys on a scalar string — confluence's `parentId`, notion's `pageId`, github's `targetId`, linear's
@@ -1245,7 +1282,7 @@ the leaf contract that closed or deliberately adjudicated the finding.
 | **The expiry latch re-arms with two writes.** `clearCredentialExpiryLatch` clears the boolean and writes a fresh arm. Were the second to fail alone, an in-flight notification for the replaced credentials would match the surviving arm and latch the new ones — the one *silencing* failure in a module whose every other window fails toward a harmless duplicate notification. | every port with a refresh flow | Both writes are adjacent, awaitless and constant-size, so one implicit transaction carries them and no trigger separates them; the function's doc comment states that adjacency as the invariant to preserve. Every candidate fix is worse than the window: swapping the order makes the silence deterministic, and one combined record breaks the plain-boolean compatibility every shipped gatekeeper reads. **Narrowed:** every credential *replacement* re-arms through `#commit`, not only `connect()` — a successful refresh racing a notification for the credentials it replaces can no longer let that notification latch it, which was the same silencing class reachable with no storage failure at all. The legacy migration publishes without re-arming (`#publish`), since moving a grant between layouts replaces nothing and would otherwise re-announce a death the account already reported. |
 | **A crash mid-withheld-read closes admission for good.** The `observer-withhold:<nonce>` marker goes down before the overseer is asked, and an activation can die before settling it. | every strategy-C port using `withholdFromObservers` | **Resolved without weakening the fence:** a per-storage in-memory set owns markers for genuinely active reads. `addObserver` promotes every durable marker not owned by the current activation into the permanent `observer-withheld` latch, then deletes it; a marked refusal still removes its own marker. A crash or lost reply therefore remains fail-closed, but stranded markers no longer accumulate or remain a second indefinite state. No age heuristic: a legitimately slow authorization stays active however long it takes. |
 | **A lost `authorizeObservation` reply no longer reopens admission over a standing fence.** `ObservationGate.authorize` calls `discard` only for a marked refusal; an unmarked transport or service error calls `abandon`, releasing in-memory bookkeeping while retaining durable set and withheld-read fences (`observers.ts:238-251`; `observer-tracker.ts:38-51,304-323,437-453`). | every strategy-C port | **Kit side shipped; kernel mark outstanding.** The kit reclaims prepared state only for a marked refusal and treats every other failure as an unknown outcome, which is the fail-closed half. The mark itself does not exist yet: `workshop-shared` defines no transport-stable refusal code, and both of the overseer's pre-recording refusal paths still throw plain `Error`s, so *every* real refusal takes the unknown-outcome path -- a legitimate policy refusal latches `observer-withheld` permanently and leaves tracked-collection markers holding capacity. Closing it is a kernel change (define the code and factory in `workshop-shared`, throw it from both paths, re-export from the kit) and is deliberately outside this branch. *Trigger:* the kernel PR that adds the mark. |
-| **A first-time observer is not yet in the overseer's observer table while its gatekeeper admissions are in flight.** A gatekeeper can already name the fresh id in `excludeObservers`, but the former lookup treated the unknown id as stale and admitted the observation; after every admission completed, the observer record became durable without rechecking that read. | every collaborator opening a workspace for the first time | **Resolved in the kernel:** `OverseerImpl` registers each fresh id in an in-memory pending set before any admission await. Forward exclusion treats a matching pending id as an active blocker, then the successful promotion or terminal rollback removes it. A restart needs no durable marker because it aborts both the parked admission and the concurrent observation. |
+| **A first-time observer is not yet in the overseer's observer table while its gatekeeper admissions are in flight.** A gatekeeper can already name the fresh id in `excludeObservers`, but the former lookup treated the unknown id as stale and admitted the observation; after every admission completed, the observer record became durable without rechecking that read. | every collaborator opening a workspace for the first time | **Resolved in the kernel:** `OverseerImpl.ensureObserver` reserves the observer record, with no account choices, before any admission await, so forward exclusion resolves the fresh id as an active blocker from the moment any connection can name it. Concurrent admissions by the same profile share that id, and a failed admission keeps its registrations; the record goes only when the profile loses access. |
 | **A dropped action kind strands its dependents silently.** `provides`/`dependsOn` are evaluated from the live definition, so an action staged under a kind a later deploy removed reports no refs, and the dependents it was holding open are not retired with it. | any port that removes a shipped action kind | The dependent stays pending and fails at the provider instead of naming the parent it needed, so what is lost is an error message, not an effect — a ref a gatekeeper declares in `dependsOn` is by definition an identifier the provider validates. Closing it means storing the refs on the record, which puts staging metadata inside the journaled action identity and threads it through every state transition. No corpus gatekeeper stores its graph either (§4.8), so the six that cascade port without this. *Trigger:* the first port to remove a shipped action kind. |
 | **A read during an in-flight apply can overlay an effect the provider already made real.** Simulated reads project `pending` and `claimed` records, and an apply is a provider round trip followed by the journal write, so a read landing between the two fetches the real effect and overlays the same action again — a transient duplicate in the *view*, never a second provider effect (resolution is serialized). | every port with continue-with-simulation actions | Inherent to overlaying local pending state onto remote reads: no atomic instant flips both, and it holds for every projected state, so dropping `claimed` from projection would only make the action vanish mid-apply instead. Serializing reads with resolution would stall the agent for the length of a provider call on every read — the trade submission already refuses — and `runExclusive` is the opt-in for a consumer that needs a consistent snapshot. Self-healing: the next read after the journal write is correct. *Trigger:* an agent observed acting on the duplicate, e.g. staging a corrective action against it. |
 | **Refused reads reclaim their pending observed-set markers.** `prepareObservation` can remove the `"pending"` rows a read wrote once nothing is left to account for them. | every strategy-C port | **Resolved in Layer 1:** each disclosed key carries a per-storage in-memory claim recording how many reads still owe it, whether this generation of claims created its marker, and whether every claimant so far refused. The last claimant to settle reclaims the marker when all of them refused and storage still says `"pending"` (`observer-tracker.ts:88-136,424-473`). One isolate owns a Durable Object, so in-memory tracking is sound; `perStorage` shares it across trackers over the same storage object. Two markers stay by design: one whose claimants include an unknown outcome, since a lost reply may have followed a durable record, and one stranded by a crash, which a later read can never prove was refused because it did not create it. |
@@ -1662,9 +1699,23 @@ silently, and `page * perPage` arithmetic then skips the rows between with no er
 reflect the rows it consumed — a server-side-filtered search with its own next signal, confluence's
 v1 CQL — is a `TokenCursor` carrying that signal as its token.
 
-There is no `overlay`, `map` or injected-item merging. Each came from one gatekeeper's shape, with
-ordering and authorization needs the others do not share. `retain` is the one post-fetch step left,
-and the ordering rule below is what keeps it from costing a page.
+`overlay` and `map` stay in each gatekeeper's `fetchPage`: each came from one gatekeeper's shape.
+Injected-item merging did not stay out. GitHub and GitLab each grew a near-identical
+`StreamingCursor` for it (overlay, injected rows merged by comparator, re-validation at serve time),
+and the copies drifted into opposite bugs — GitHub's served duplicate rows under concurrent
+`next()` and lost a page whose fetch threw, GitLab's walked a fully filtered listing to the end in
+one call. So `inject: { items, compare, revalidate?, identity? }` lives on the buffered base, where
+it inherits serialization, the fetch bound and the refusal hold. Injected rows are the agent's own
+simulation, not provider rows: they never reach `authorizePage`, and a page made only of them is
+not authorized. Only their position carries provider information — an injected row served first
+means no fetched provider row sorts ahead of it — which a listing whose order is itself sensitive
+covers by authorizing up front. `revalidate` and `identity` run when a row is served, not when it
+is fetched, and identities count as served only once their page is authorized. A refused page's
+retry rebuilds from the entries that page consumed, re-reading the injected ones, and stops before
+a provider row the refusal did not cover, such as one a dropped injected row had hidden: that row
+leads the next page, so it is neither lost nor slipped past the refusal.
+`retain` is the one post-fetch step for provider rows, and the ordering rule below is what keeps it
+from costing a page.
 
 Filtering is the exception, because a numeric walk has no end-of-list signal but the row count.
 The numeric cursors' `fetchPage` therefore returns the provider's page **unfiltered** and an optional
@@ -1681,15 +1732,16 @@ Three rules the prior art does not have. Only an **empty** provider page ends a 
 (providers cap page size below what was asked for — Cloudflare's own `/accounts` answers 20 to a
 request for 100 — so treating a short page as the end silently omits every later record). A page the
 caller sees nothing in is not the end either, so one `next()` fetches at most
-`MAX_PROVIDER_PAGES_PER_CALL` (10) pages — **every** page, not just consecutive empty ones, since a
-provider yielding one surviving row every few pages would otherwise cost hundreds of fetches in one
-call — and then yields what it has, `[]` included, which invites another call where `null` would
-claim the list had ended. The bound is latency, not quota: the fetches are sequential and the caller
-is blocked on them, while 10 still fills a 100-row page from a provider dropping 90% of what it
-returns. A short page is legal, so a port needing more per call raises `remotePageSize` rather than
-expecting one call to fill.
-And `next()` is serialized on a `SerialTaskQueue` (§4.12), since two un-awaited callers racing on the
-page counter would return one page twice and skip the next.
+`maxProviderPagesPerCall` (default 10) pages — **every** page, not just consecutive empty ones,
+since a provider yielding one surviving row every few pages would otherwise cost hundreds of fetches
+in one call — and then yields what it has, `[]` included, which invites another call where `null`
+would claim the list had ended. The default bound is latency, not quota: the fetches are sequential
+and the caller is blocked on them, while 10 still fills a 100-row page from a provider dropping 90%
+of what it returns. A short page is legal, so a port needing more per call raises `remotePageSize`
+rather than expecting one call to fill. A provider that bills each row it returns lowers it: `1`
+with a `pageSize` no provider page exceeds makes each `next()` one request. And `next()` is
+serialized on a `SerialTaskQueue` (§4.12), since two un-awaited callers racing on the page counter
+would return one page twice and skip the next.
 
 **Nothing latches a failure, because no paging state moves until every step that can throw has
 run.** `PageNumberCursor` and `OffsetCursor` decide exhaustion from the raw page and apply `retain`
@@ -1729,16 +1781,17 @@ Two rules follow from the token being opaque, and both belong to this class alon
 token, and the walk would otherwise re-fetch that page until a cap. Only the immediately-prior token
 is compared — an unbounded seen-set would grow with the walk it is meant to protect — and the first
 page, asked `undefined`, is exempt by construction. The refusal is stable and non-advancing, so a
-retry re-asks the same token and is refused again rather than losing the position. And a fixed
-shared `MAX_PROVIDER_PAGES_PER_CALL` bound of **10 provider pages** per `next()` call keeps a quiet
-stream from looping forever and also bounds sparse streams: every provider page counts, not just
-consecutive empty ones. At the bound `next()` returns the buffer *even when empty*, because `[]` is
-a legal non-terminal page (only `null` ends a `Cursor`) and the next call resumes the walk with a
-window. It is not an option: google's `CursorPager` hard-codes its own bound, internal cf-wiki loops
-unbounded (a hang on a broken provider), and nobody tunes it per resource. The numeric cursor needs
-no such bound, since an empty page ends its walk. Neither detects a provider that ignores the page
-argument and keeps answering with rows, which yields duplicates instead of ending; that needs an item
-identity the cursor does not have, and no page ceiling substitutes for one.
+retry re-asks the same token and is refused again rather than losing the position. And the
+`maxProviderPagesPerCall` bound keeps a quiet stream from looping forever and also bounds sparse
+streams: every provider page counts, not just consecutive empty ones. At the bound `next()` returns
+the buffer *even when empty*, because `[]` is a legal non-terminal page (only `null` ends a
+`Cursor`) and the next call resumes the walk with a window. It is an option rather than a constant
+because a provider that bills or rate-limits per request wants a lower one — google's own
+`CursorPager` exposes the same bound and Chat sets it to 3, and X's own cursor fetches one page per
+call because X bills every row a read returns — though no kit consumer lowers it yet. Neither
+cursor detects a provider that ignores the page argument and keeps answering with rows, which
+yields duplicates instead of ending; `inject.identity` dedups only what it is told is the same row,
+and no page ceiling substitutes for an identity.
 
 `PageHookCursor<T>` wraps a cursor the gatekeeper already built and runs `beforePage(items)` on each
 page before `next()` returns it — for listings that authorize their observation once, up front, so
@@ -1919,6 +1972,8 @@ export function normalizeVendorEndpoint(raw: string, options: {
   label: string;                    // names the endpoint in the thrown message
   requireHttps?: boolean;           // default true
 }): string;                         // origin + normalized path; no query, userinfo or fragment
+export function pathSegment(value: string): string;
+export function pathSegments(value: string): string;
 ```
 
 For the operator-pasted endpoint an instance-hosted vendor needs (marketo's `<munchkin>.mktorest.com`,
@@ -1957,12 +2012,23 @@ query. mcp-shared's endpoint **blocklist** (`endpoint.ts:17-45`) is deliberately
 it is MCP-scoped SSRF defence with its own trust boundary, and moving it would churn shipped code
 for no new consumer.
 
+`pathSegment` and `pathSegments` are the other half of a provider URL: the agent-supplied ids
+interpolated into its path. `encodeURIComponent` leaves `.` and `..` literal, and WHATWG URL
+parsing resolves them (percent-encoded `%2e%2e` too), so an id of `..` climbs out of the route
+prefix it was placed in. They refuse `""`, `.` and `..` and encode everything else; `pathSegments`
+splits a `/`-separated name (a GitLab project path, a Chat media resource) and applies the same per
+segment, so a leading, trailing or doubled slash is refused as an empty segment. The id grammar
+(charset, length) stays the gatekeeper's, and the error echoes only the refused segment, at most
+two characters. Three internal copies disagreed (sentry refused any `..` substring, firstbase only
+exact dots, zip encoded `%2e`).
+
 ### 4.15 `./response-body`
 
 ```ts
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
 export class ResponseTooLargeError extends Error {}
 export function readTextCapped(response: Request | Response, maxBytes?: number): Promise<string>;
+export function readTextPrefix(body: Request | Response, maxBytes: number): Promise<string>;
 ```
 
 The one thing the competing `gatekeeper-factory-research` branch surfaced that belongs here — and it
@@ -1993,6 +2059,13 @@ origin-scoped headers when one crosses origins (`fetch.ts:142-209`), the factory
 refuses any redirect leaving its declared origin, and `normalizeVendorEndpoint` (§4.14) admits an
 operator-pasted vendor host. Those are three different trust boundaries, and a helper spanning them
 would have to expose knobs for exactly the policy it claims to centralize.
+
+`readTextPrefix` is the one exception to "refused rather than truncated", and is a separate export
+so the strict reader keeps its all-or-nothing contract. It decorates an error already being raised
+with the first `maxBytes` of the body — an HTML error page past the strict cap otherwise yields no
+excerpt at all — so it truncates, ignores `Content-Length`, cancels the rest, and never throws on
+the body: a used, locked or failing body returns what decoded, possibly `""`, because a read failure
+must not replace the provider error it was decorating.
 
 ### 4.16 `./preview-oauth`
 
@@ -2222,8 +2295,9 @@ endpoint answers for a revoked grant. A 4xx without one, such as a WAF challenge
 
 ```ts
 export function buildGitFetchRequest(oids: GitOid[], hints: GitPullHints): Uint8Array;
-export function pullGitObjectsIntoCache(fetchUploadPack: (requestBody: Uint8Array) => Promise<Response>,
-  oids: GitOid[], hints: GitPullHints, cache: GitPackSink): Promise<void>;
+export function pullGitPack(fetchUploadPack: (requestBody: Uint8Array) => Promise<Response>,
+  oids: GitOid[], hints: GitPullHints,
+  onTerminal?: (status: GitPullStatus) => void): Promise<ReadableStream<Uint8Array>>;
 export function validateBranchName(branch: string): string;
 export function pushGitRefUpdate(
   fetchReceivePack: (requestBody: ReadableStream<Uint8Array>) => Promise<Response>,
@@ -2231,6 +2305,8 @@ export function pushGitRefUpdate(
 export class GitRefUpdateRejectedError extends Error { readonly reason: string }
 export function emptyPackBytes(): Promise<Uint8Array>;
 export const ZERO_OID: string;
+export function simulateBranchHead(realHead: GitOid | null,
+  pushes: readonly { expectedOldSha: GitOid; newSha: GitOid }[]): GitOid | null;
 ```
 
 Git smart-HTTP protocol v2 framing, moved verbatim from gatekeeper-github: pkt-line encoding and
@@ -2239,7 +2315,27 @@ compare-and-swap with its report-status parsing. The gatekeeper's callback suppl
 credentials, the timeouts and the protocol headers (`Git-Protocol: version=2` among them); the kit
 owns the bodies. A pre-receive refusal surfaces as `GitRefUpdateRejectedError.reason`, the server's
 own line, which the gatekeeper passes through. `filterSpecForHints` encodes GitHub's verified
-partial-clone limits; other servers may accept more. Consumed by github and gitlab.
+partial-clone limits; other servers may accept more. `simulateBranchHead` overlays a branch's
+queued ref updates on its real head by the same compare-and-swap rule, chain-following in any list
+order, so a simulated read and the next push's expected old sha agree; a push to `ZERO_OID`
+deletes, reading as `null`. Consumed by github and gitlab.
+
+The Workers-only `./git-pull-transfer` leaf wraps `pullGitPack` for the kernel-facing
+`Gatekeeper.gitPull(oids, options)` API:
+
+```ts
+export function startGitPull(fetchUploadPack: (requestBody: Uint8Array) => Promise<Response>,
+  oids: GitOid[], hints: GitPullHints): Promise<GitPullTransfer>;
+```
+
+`GitPullTransfer` exposes one-shot `stream()` and independent terminal `status()` so provider
+errors remain available if Workers RPC replaces a stream exception. Consumers must require
+`complete` after EOF, cancel unfinished streams, and dispose the capability. The provider does
+not parse packs, ingest cache objects, or impose the DO cache's size limit. The overseer routes
+pulls using recorded provenance, decodes the stream with its pack/object limits, and checks
+requested-object presence. The transport checks oid syntax, not advertisement history; the
+gatekeeper method is not gadget-facing. A separate kernel container-bootstrap consumer can use
+the stream directly with native Git and its own limits, but is not enabled by this helper alone.
 
 ### 4.21 `./git-diff`
 
@@ -2257,6 +2353,7 @@ export function changedPathsBetweenTrees(source: TreeDiffSource, oldTree: GitOid
 export function diffTextLines(oldText: string, newText: string):
   { hunks: GitDiffHunk[]; additions: number; deletions: number };
 export function parseGitTreePayload(payload: Uint8Array, oid: GitOid): GitTreeEntry[];
+export function parseUnifiedPatch(patch: string): GitDiffHunk[];
 ```
 
 A tree-to-tree diff over an injected `TreeDiffSource`, so a gatekeeper can simulate the diff of
@@ -2265,8 +2362,10 @@ vendor-neutral; each gatekeeper's agent-facing `types.d.ts` keeps structurally i
 (that text must stay self-contained). `MAX_DIFF_*` cap blob size, total bytes, and lines diffed per
 file, and `MAX_DIFF_OUTPUT_PER_FILE`/`MAX_DIFF_OUTPUT_TOTAL` cap the hunk text emitted, so a
 result stays under Durable Object storage's 2 MB value limit; a file past any cap reports
-`diffOmitted` and no hunks, and one past an output cap keeps its line counts. The reader of
-unified patches (`parsePatch`) is still per gatekeeper; see §11.
+`diffOmitted` and no hunks, and one past an output cap keeps its line counts. `parseUnifiedPatch`
+reads a provider's per-file patches into the same hunk shape, so simulated and provider diffs share
+one grammar; a patch's final newline ends its last line rather than starting a blank one. It does
+not enforce hunk line counts, so a multi-file diff must be split by file first.
 
 ### 4.22 `./git-objects`
 
@@ -2288,6 +2387,33 @@ the `PageHookCursor` hook for git listings: an id counts as advertised only once
 lands, so a failed page is advertised in full when re-offered. `withhold` names ids the remote
 cannot supply yet — simulated heads of queued pushes — and is consulted per batch, so a push queued
 mid-walk is honoured.
+
+### 4.23 `./subresource-ids`
+
+```ts
+export type SubresourceFragment = { name: string; id: string };   // both non-empty
+export type SubresourceId = { namespace?: string;                // non-empty when present
+  fragments: readonly SubresourceFragment[] };                     // at least one
+export function formatSubresourceId(value: SubresourceId): string;
+export function parseSubresourceId(id: string): SubresourceId;   // canonical spelling only
+```
+
+One encoding for `ObservationDescription.subresources`, so gatekeepers do not each invent a
+delimiter scheme. The Workshop treats the IDs as opaque, so the format belongs to the kit, not
+`workshop-shared`. Every component is `encodeURIComponent`-escaped and joined by `/`. Escaping keeps
+`/` out of every component, and each fragment contributes two, so an odd component count marks the
+leading namespace without a separate marker.
+
+**Fragments name resources, not predicates.** `gmail/inbox/<address>` identifies a mailbox. That
+no collaborator may ever see it is the verifier's mapping from that kind of resource to a check,
+not something the ID asserts. That keeps one vocabulary across gatekeepers whose policies differ.
+The namespace is a product family (Google's `gmail`, `drive`, `bigquery`), never the
+gatekeeper's own name; a single-product gatekeeper omits it.
+
+**One spelling per value.** The Workshop deduplicates and indexes requirements by string, so
+`parseSubresourceId` refuses any spelling `formatSubresourceId` would not produce, such as a
+lowercase or needless escape, instead of decoding it to a nearby resource. The 512-code-unit ID
+bound stays the overseer's to enforce; the kit does not keep a second copy.
 
 ## 5. Layer 2: the assembly
 
@@ -2854,7 +2980,7 @@ These are load-bearing; the fixture suite (§7 step 11) exists to prove each one
 - **workerd for nonce tests.** `crypto.subtle.timingSafeEqual` does not exist in Node, so the
   kit runs two vitest projects: `vitest.config.ts` (Node, pure modules: actions, observers,
   credentials, auth-retry, simulation, cache, connect-pages, endpoint, http-errors,
-  response-body, spec, http routing) and
+  response-body, subresource-ids, spec, http routing) and
   `vitest.worker.config.ts` (workerd: connect-nonce, connect-handshake, credential-expiry,
   cursors, the action queue, and the fixture). The workerd project loads
   `scripts/assert-workerd.ts` so a broken pool fails loudly. `connect-pages` and `endpoint` are
@@ -3022,8 +3148,8 @@ Each step leaves the tree building; tests land with the module they cover. Nothi
    refused at the type level; `claimBeforeApply` plus a plain throw restores `pending` and a second apply
    reaches the provider; an `ActionApplyError` records the failure, answers every replay from the
    record with no provider call, and is cleared only by `reject`; a claim a second bind finds
-   over the same journal is converted to `APPLY_OUTCOME_UNKNOWN_MESSAGE` by both verbs without
-   running a handler; and a journal write that fails *after* the handler succeeded leaves the
+   over the same journal is converted to `APPLY_OUTCOME_UNKNOWN_MESSAGE` by apply and removed as
+   `rejected` by the first reject, neither verb running a handler; and a journal write that fails *after* the handler succeeded leaves the
    record `claimed`, fires no hook, and is reported unknown on the next attempt rather than being
    rolled back to `pending`. `SerialTaskQueue`
    ordering and rejection isolation live in the **workerd** project
@@ -3299,7 +3425,12 @@ evidence, and the trigger.
   idempotency key and lookup by it — 0 of 15 live writers probe today, and three independently chose
   the manual-check message instead (`mcp-shared/src/action-store.ts:43-46`,
   `ironclad.ts:916-931`, and the kit). Half the work is already done: `ActionContext.id` is the
-  stable key such a probe would look up.
+  stable key such a probe would look up. Reviewed again and still deferred: X, the one candidate,
+  has neither (its probe matches recent posts by text inside a time window), Google Chat sets
+  `requestId` and needs no claim at all, and internal Jira and Salesforce refuse the retry, which
+  `claimBeforeApply` already does. A probe keyed on a gatekeeper's own attempt marker also misreads
+  the gap between the provider's success and the journal's applied record: the marker is cleared
+  first, so a crash there reads as absent and dispatches again.
 - **A `reverting` marker** for the retained tier, so an interrupted compensating call is
   distinguishable from a completed one. No gatekeeper in either corpus persists one, which is why
   all 11 functional reverts are silently replayable; the kit already owns the right primitive in
@@ -3345,20 +3476,18 @@ recorded here because the pass found it. Each entry names why it waits and what 
   hand-written retry loop.
 - **Hook delivery** (`startHook`, observe, deliver, dispose). Only email and scheduler produce hooks,
   with different policies. *Trigger:* a third producer.
-- **Simulated-item cursor overlay.** cf-wiki and GitHub's provisional items order differently.
-  GitHub and GitLab now carry near-identical `StreamingCursor`s (overlay, injected rows merged by
-  comparator, re-validation at serve time); GitLab's buffers before serving and serializes `next()`,
-  GitHub's still loses the rows of a page whose fetch throws. *Trigger:* the git extraction below.
 - **Resource-pattern scope helpers.** Cloudflare, Google, Slack and internal Ironclad each model the
   granted scope differently, so there is no shared contract yet. *Trigger:* a second gatekeeper
   that records requested and granted scopes the way Google does.
-- **Git push simulation.** The pending-chain walk, simulated branch heads, the served-id set,
-  `SessionGitCache`, push apply and rollback, and `parsePatch` are duplicated across github and
-  gitlab, and where the copies differ GitHub's side is the bug, not a provider difference: GitLab's
-  plan records its first-parent walk and missing cascade through stacked pushes as GitHub bugs, and
-  GitHub also drops the rejection reason and lacks the trailing-newline guard. *Trigger:* the next
-  change to either copy — land it as the extraction, into `./git-diff` and a git-simulation leaf,
-  with GitLab's behaviour.
+- **Git push simulation, remainder.** `parseUnifiedPatch` (`./git-diff`) and `simulateBranchHead`
+  (`./git-transport`) were extracted, and `SessionGitCache` already lived in `./cursors`. What stays
+  per gatekeeper is entangled with provider APIs and durable action records: the pending-chain walk
+  (GitHub probes each commit, GitLab splits side ancestry and asks `/merge_base`; both list first
+  parents only), tree comparison, push refusal wording, rollback, and the rejected-push cascade.
+  Two GitHub gaps remain local fixes, not kit work: rollback drops the receive-pack reason, and
+  rejection does not cascade through stacked pushes as GitLab's `#rejectActionsStrandedByPush`
+  does. *Trigger:* a third git gatekeeper, or a pure chain walker returning `{ firstParent, pending,
+  frontier }` that both can call.
 
 Rejected: a `clientCredentials()` grant (`OAuthClient.request("token", …)` covers both instances, and
 Zylo returns `expires_on`), streaming `ActionFileStore` capture (no Drive upload exists), and a
